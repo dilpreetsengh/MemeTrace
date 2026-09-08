@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="MemeTrace local research dashboard." />
+    <title>MemeTrace — Qualified Candidates</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">SOLANA RESEARCH POC</p>
+          <h1>MemeTrace</h1>
+          <p class="subtitle">Find qualified low-cap candidates, then explain the risk before the hype.</p>
+        </div>
+        <div class="status"><span></span><span id="data-status">Loading…</span></div>
+      </header>
+
+      <section class="hero card">
+        <div>
+          <p class="eyebrow">FIRST WORKING FEATURE</p>
+          <h2>Qualified Candidates</h2>
+          <p>
+            This is the decision layer: market-cap lane, liquidity, trading age,
+            buyer pressure, sellability, and safety gates become one explainable research card.
+          </p>
+        </div>
+        <button id="refresh" type="button">Refresh feed</button>
+      </section>
+
+      <section class="metrics" id="metrics" aria-label="Candidate feed summary"></section>
+
+      <section class="workspace">
+        <article class="card feed-panel">
+          <div class="section-title">
+            <div>
+              <h2>Candidate feed</h2>
+              <p>Ranked by research status, then score.</p>
+            </div>
+            <div class="filters" id="filters" aria-label="Filter candidates"></div>
+          </div>
+          <div id="candidate-list" class="candidate-list" aria-live="polite"></div>
+        </article>
+
+        <aside class="card detail-panel" id="candidate-detail" aria-live="polite"></aside>
+      </section>
+
+      <p class="feed-note" id="feed-note"></p>
+      <footer>
+        Prototype principle: research prompts are not trade advice. No wallet connection, auto-buying, or live token data exists in this version.
+      </footer>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
