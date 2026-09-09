@@ -20,8 +20,8 @@ The first product feature is a local **Qualified Candidates** feed:
 The initial cards are fictional sample fixtures. Click **Get live Solana pairs**
 to replace them with a deliberately bounded multi-source discovery pass:
 DEX Screener, Solana Tracker's latest/trending/graduated feeds, and CoinGecko's
-new-pools feed. The existing Solana Tracker and CoinGecko keys enable the latter
-two sources; no additional account is required.
+new-pools plus one-hour trending-pools feeds. The existing Solana Tracker and
+CoinGecko keys enable the latter two sources; no additional account is required.
 
 After the first live scan, MemeTrace never replaces an empty result with sample
 coins: no card means no fresh Solana pair currently passed the live-motion rules.
@@ -148,6 +148,9 @@ market cap, $25k liquidity, $2k genuine five-minute volume, at least ten recent
 swaps, at least 1.3× as many buys as sells, and +3% to +25% five-minute price
 movement. Live cards expire from the active feed after 15 minutes unless a new
 scan finds them again. These are discovery filters, not quality or safety proof.
+If nothing passes, the completed scan now reports how many current pair snapshots
+were checked and the most common near-miss gates, rather than implying that no
+moving coins exist anywhere.
 
 ## Strict risk policy
 
