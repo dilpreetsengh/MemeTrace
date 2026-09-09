@@ -17,12 +17,14 @@ const elements = {
   list: document.querySelector('#candidate-list'),
   detail: document.querySelector('#candidate-detail'),
   dataStatus: document.querySelector('#data-status'),
+  fullScan: document.querySelector('#full-scan'),
   refresh: document.querySelector('#refresh'),
   quoteCheck: document.querySelector('#quote-check'),
   safetyCheck: document.querySelector('#safety-check'),
   walletCheck: document.querySelector('#wallet-check'),
   crosscheck: document.querySelector('#crosscheck'),
   note: document.querySelector('#feed-note'),
+  scanSummary: document.querySelector('#scan-summary'),
 };
 
 function escapeHtml(value) {
@@ -238,12 +240,36 @@ async function loadCandidates({ keepButtonDisabled = false } = {}) {
   }
 }
 
+function setResearchControlsDisabled(disabled) {
+  [elements.fullScan, elements.refresh, elements.quoteCheck, elements.safetyCheck,
+    elements.walletCheck, elements.crosscheck].forEach((button) => {
+    button.disabled = disabled;
+  });
+}
+
+async function runFullResearchScan() {
+  setResearchControlsDisabled(true);
+  elements.dataStatus.textContent = 'Running full research scan…';
+  elements.scanSummary.textContent = 'Finding pairs, checking sellability, safety, public wallet evidence, and market data…';
+  try {
+    const response = await fetch('/api/candidates/full-scan', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Full research scan returned ' + response.status);
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = result.summary.headline;
+    elements.scanSummary.textContent = result.summary.detail;
+    elements.note.textContent = result.summary.detail;
+  } catch (error) {
+    elements.dataStatus.textContent = 'Full scan unavailable';
+    elements.scanSummary.textContent = error.message;
+    elements.note.textContent = error.message;
+  } finally {
+    setResearchControlsDisabled(false);
+  }
+}
+
 async function refreshCandidates() {
-  elements.refresh.disabled = true;
-  elements.quoteCheck.disabled = true;
-  elements.safetyCheck.disabled = true;
-  elements.walletCheck.disabled = true;
-  elements.crosscheck.disabled = true;
+  setResearchControlsDisabled(true);
   elements.dataStatus.textContent = 'Getting public Solana pairs…';
   try {
     const response = await fetch('/api/candidates/refresh', { method: 'POST' });
@@ -257,20 +283,12 @@ async function refreshCandidates() {
     elements.dataStatus.textContent = 'Live refresh unavailable';
     elements.note.textContent = error.message;
   } finally {
-    elements.refresh.disabled = false;
-    elements.quoteCheck.disabled = false;
-    elements.safetyCheck.disabled = false;
-    elements.walletCheck.disabled = false;
-    elements.crosscheck.disabled = false;
+    setResearchControlsDisabled(false);
   }
 }
 
 async function checkSellRoutes() {
-  elements.refresh.disabled = true;
-  elements.quoteCheck.disabled = true;
-  elements.safetyCheck.disabled = true;
-  elements.walletCheck.disabled = true;
-  elements.crosscheck.disabled = true;
+  setResearchControlsDisabled(true);
   elements.dataStatus.textContent = 'Checking small sell routes…';
   try {
     const response = await fetch('/api/candidates/quote-check', { method: 'POST' });
@@ -287,20 +305,12 @@ async function checkSellRoutes() {
     elements.dataStatus.textContent = 'Sell-route check unavailable';
     elements.note.textContent = error.message;
   } finally {
-    elements.refresh.disabled = false;
-    elements.quoteCheck.disabled = false;
-    elements.safetyCheck.disabled = false;
-    elements.walletCheck.disabled = false;
-    elements.crosscheck.disabled = false;
+    setResearchControlsDisabled(false);
   }
 }
 
 async function checkTokenSafety() {
-  elements.refresh.disabled = true;
-  elements.quoteCheck.disabled = true;
-  elements.safetyCheck.disabled = true;
-  elements.walletCheck.disabled = true;
-  elements.crosscheck.disabled = true;
+  setResearchControlsDisabled(true);
   elements.dataStatus.textContent = 'Checking token safety…';
   try {
     const response = await fetch('/api/candidates/safety-check', { method: 'POST' });
@@ -317,20 +327,12 @@ async function checkTokenSafety() {
     elements.dataStatus.textContent = 'Safety check unavailable';
     elements.note.textContent = error.message;
   } finally {
-    elements.refresh.disabled = false;
-    elements.quoteCheck.disabled = false;
-    elements.safetyCheck.disabled = false;
-    elements.walletCheck.disabled = false;
-    elements.crosscheck.disabled = false;
+    setResearchControlsDisabled(false);
   }
 }
 
 async function checkWalletEvidence() {
-  elements.refresh.disabled = true;
-  elements.quoteCheck.disabled = true;
-  elements.safetyCheck.disabled = true;
-  elements.walletCheck.disabled = true;
-  elements.crosscheck.disabled = true;
+  setResearchControlsDisabled(true);
   elements.dataStatus.textContent = 'Checking public wallet evidence…';
   try {
     const response = await fetch('/api/candidates/wallet-check', { method: 'POST' });
@@ -347,20 +349,12 @@ async function checkWalletEvidence() {
     elements.dataStatus.textContent = 'Wallet evidence unavailable';
     elements.note.textContent = error.message;
   } finally {
-    elements.refresh.disabled = false;
-    elements.quoteCheck.disabled = false;
-    elements.safetyCheck.disabled = false;
-    elements.walletCheck.disabled = false;
-    elements.crosscheck.disabled = false;
+    setResearchControlsDisabled(false);
   }
 }
 
 async function crosscheckMarketData() {
-  elements.refresh.disabled = true;
-  elements.quoteCheck.disabled = true;
-  elements.safetyCheck.disabled = true;
-  elements.walletCheck.disabled = true;
-  elements.crosscheck.disabled = true;
+  setResearchControlsDisabled(true);
   elements.dataStatus.textContent = 'Cross-checking pool data…';
   try {
     const response = await fetch('/api/candidates/crosscheck', { method: 'POST' });
@@ -377,11 +371,7 @@ async function crosscheckMarketData() {
     elements.dataStatus.textContent = 'Cross-check unavailable';
     elements.note.textContent = error.message;
   } finally {
-    elements.refresh.disabled = false;
-    elements.quoteCheck.disabled = false;
-    elements.safetyCheck.disabled = false;
-    elements.walletCheck.disabled = false;
-    elements.crosscheck.disabled = false;
+    setResearchControlsDisabled(false);
   }
 }
 
@@ -402,6 +392,7 @@ elements.list.addEventListener('click', (event) => {
   renderDetail();
 });
 
+elements.fullScan.addEventListener('click', runFullResearchScan);
 elements.refresh.addEventListener('click', refreshCandidates);
 elements.quoteCheck.addEventListener('click', checkSellRoutes);
 elements.safetyCheck.addEventListener('click', checkTokenSafety);
