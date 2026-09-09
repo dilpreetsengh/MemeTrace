@@ -43,7 +43,7 @@ STATUS_ORDER = {"candidate": 0, "watch": 1, "avoid": 2}
 VALID_STATUSES = set(STATUS_ORDER)
 DEX_SCREENER_API_BASE = "https://api.dexscreener.com"
 DEX_DISCOVERY_MAX_TOKENS = 15
-DEX_DISCOVERY_MIN_MARKET_CAP_USD = 75_000
+DEX_DISCOVERY_MIN_MARKET_CAP_USD = 70_000
 DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
 DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
 DEX_DISCOVERY_MIN_AGE_MINUTES = 5
@@ -298,10 +298,10 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
     gates: list[dict[str, str]] = []
     hard_failures: list[str] = []
 
-    if 100_000 <= market_cap <= 750_000:
+    if 70_000 <= market_cap <= 750_000:
         score += 12
-        gates.append({"label": "Market-cap lane", "status": "PASS", "detail": "Inside the $100k–$750k starter range."})
-    elif 75_000 <= market_cap <= 3_000_000:
+        gates.append({"label": "Market-cap lane", "status": "PASS", "detail": "Inside the $70k–$750k starter range."})
+    elif 750_000 < market_cap <= 3_000_000:
         score += 4
         gates.append({"label": "Market-cap lane", "status": "WATCH", "detail": "Outside the primary lane; review manually."})
     else:
