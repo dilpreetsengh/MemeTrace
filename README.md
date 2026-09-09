@@ -125,7 +125,7 @@ python3 -m unittest -v
 
 A real candidate will eventually need to pass:
 
-- Primary market-cap lane: roughly $100k–$750k.
+- Primary market-cap lane: roughly $70k–$750k.
 - At least $25k liquidity; $50k+ is stronger.
 - At least five minutes of trading history.
 - Favorable recent buy/sell pressure and volume relative to liquidity.
@@ -142,7 +142,7 @@ The multi-source refresh combines a small DEX Screener shortlist, Solana Tracker
 latest/trending/graduated token records, and two CoinGecko new-pool pages. Tracker
 is used to discover token addresses, while DEX Screener supplies the genuine
 five-minute price, volume, and swap data used by the live filter. It deduplicates
-mints and keeps pairs that are 5 minutes to 7 days old with roughly $75k–$3m
+mints and keeps pairs that are 5 minutes to 7 days old with roughly $70k–$3m
 market cap, $25k liquidity, $2k genuine five-minute volume, at least ten recent
 swaps, at least 1.15× as many buys as sells, and at least +3% five-minute price
 movement. Live cards expire from the active feed after 15 minutes unless a new
