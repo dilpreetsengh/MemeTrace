@@ -179,10 +179,13 @@ class CandidateFeedTests(unittest.TestCase):
         flat.update({"source": "dexscreener", "price_change_5m_pct": 0})
         seller_heavy = dict(server.SAMPLE_CANDIDATES[0])
         seller_heavy.update({"source": "dexscreener", "buys_5m": 30, "sells_5m": 30})
+        vertical = dict(server.SAMPLE_CANDIDATES[0])
+        vertical.update({"source": "dexscreener", "price_change_5m_pct": 26})
 
         self.assertFalse(server.passes_dex_discovery_filter(old))
         self.assertFalse(server.passes_dex_discovery_filter(flat))
         self.assertFalse(server.passes_dex_discovery_filter(seller_heavy))
+        self.assertFalse(server.passes_dex_discovery_filter(vertical))
 
     def test_dexscreener_filter_rejects_thin_pair(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
@@ -340,11 +343,11 @@ class CandidateFeedTests(unittest.TestCase):
         result = server.enrich_helius_wallet_evidence(fake_asset_fetcher, fake_transactions, now)
         live = server.candidate_feed()["candidates"][0]
 
-        self.assertEqual(result["clear"], 1)
-        self.assertEqual(live["safety_status"], "pass")
+        self.assertEqual(result["watch"], 1)
+        self.assertEqual(live["safety_status"], "watch")
         self.assertEqual(live["creator_address"], creator)
         self.assertEqual(live["wallet_evidence"]["recent_token_outflows_from_observed_address"], 1)
-        self.assertEqual(live["status"], "watch")  # CoinGecko cross-check is still required.
+        self.assertEqual(live["status"], "watch")  # Creator distribution evidence blocks Candidate status.
 
     def test_helius_active_mint_authority_is_a_hard_flag(self):
         result = server.interpret_helius_wallet_evidence(
@@ -355,6 +358,23 @@ class CandidateFeedTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "avoid")
         self.assertIn("mint authority", result["flags"][0])
+
+    def test_tracker_holder_concentration_and_developer_limits_are_enforced(self):
+        concentrated = server.interpret_solana_tracker_risk({"risk": {
+            "score": 2, "top10": 16, "snipers": {"totalPercentage": 3},
+            "insiders": {"totalPercentage": 2}, "bundlers": {"totalPercentage": 1},
+            "dev": {"percentage": 0.5}, "risks": [],
+        }})
+        developer_watch = server.interpret_solana_tracker_risk({"risk": {
+            "score": 2, "top10": 8, "snipers": {"totalPercentage": 3},
+            "insiders": {"totalPercentage": 2}, "bundlers": {"totalPercentage": 1},
+            "dev": {"percentage": 2}, "risks": [],
+        }})
+
+        self.assertEqual(concentrated["status"], "avoid")
+        self.assertIn("top 10 holders", concentrated["flags"][0])
+        self.assertEqual(developer_watch["status"], "watch")
+        self.assertEqual(developer_watch["evidence"]["developer_holder_pct"], 2)
 
     def test_coingecko_consistent_pool_data_completes_final_candidate_gate(self):
         now = 1_800_000_000
