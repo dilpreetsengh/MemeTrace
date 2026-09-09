@@ -18,6 +18,7 @@ const elements = {
   detail: document.querySelector('#candidate-detail'),
   dataStatus: document.querySelector('#data-status'),
   refresh: document.querySelector('#refresh'),
+  quoteCheck: document.querySelector('#quote-check'),
   note: document.querySelector('#feed-note'),
 };
 
@@ -218,6 +219,7 @@ async function loadCandidates({ keepButtonDisabled = false } = {}) {
 
 async function refreshCandidates() {
   elements.refresh.disabled = true;
+  elements.quoteCheck.disabled = true;
   elements.dataStatus.textContent = 'Getting public Solana pairs…';
   try {
     const response = await fetch('/api/candidates/refresh', { method: 'POST' });
@@ -232,6 +234,29 @@ async function refreshCandidates() {
     elements.note.textContent = error.message;
   } finally {
     elements.refresh.disabled = false;
+    elements.quoteCheck.disabled = false;
+  }
+}
+
+async function checkSellRoutes() {
+  elements.refresh.disabled = true;
+  elements.quoteCheck.disabled = true;
+  elements.dataStatus.textContent = 'Checking small sell routes…';
+  try {
+    const response = await fetch('/api/candidates/quote-check', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Jupiter quote check returned ' + response.status);
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = result.checked
+      ? 'Checked ' + result.checked + ' sell routes · ' + result.sellable + ' found'
+      : 'Jupiter key setup needed';
+    elements.note.textContent = result.note;
+  } catch (error) {
+    elements.dataStatus.textContent = 'Sell-route check unavailable';
+    elements.note.textContent = error.message;
+  } finally {
+    elements.refresh.disabled = false;
+    elements.quoteCheck.disabled = false;
   }
 }
 
@@ -253,4 +278,5 @@ elements.list.addEventListener('click', (event) => {
 });
 
 elements.refresh.addEventListener('click', refreshCandidates);
+elements.quoteCheck.addEventListener('click', checkSellRoutes);
 loadCandidates();
