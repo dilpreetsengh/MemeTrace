@@ -21,6 +21,11 @@ The initial cards are fictional sample fixtures. Click **Get live Solana pairs**
 in the dashboard to replace them with a deliberately small public DEX Screener
 discovery pass. No DEX Screener account or key is needed for this step.
 
+With all four optional keys configured, **Run full research scan** performs that
+discovery pass and every bounded research gate in sequence, then gives one
+plain-English final summary. It remains research-only: it never connects a
+wallet, creates a transaction, or buys a token.
+
 Live cards are deliberately limited to `Watch`: a Jupiter sell route is useful
 evidence but a token-safety screen is still required. The app therefore cannot
 turn public discovery data into a trade prompt.
@@ -98,6 +103,7 @@ python3 -m unittest -v
 | --- | --- |
 | `GET /api/health` | Confirms local database setup and counts saved records. |
 | `GET /api/candidates` | Returns the ranked candidate feed. |
+| `POST /api/candidates/full-scan` | Runs DEX Screener discovery, then the bounded Jupiter, Solana Tracker, Helius, and CoinGecko checks in order and returns one research-only final summary. |
 | `POST /api/candidates/refresh` | Pulls a small set of public Solana token profiles and qualifying pairs from DEX Screener. |
 | `POST /api/candidates/quote-check` | Checks up to three saved live cards for a roughly $5 Jupiter sell route; never sends a transaction. |
 | `POST /api/candidates/safety-check` | Sends route-confirmed cards to Solana Tracker and records point-in-time token-risk evidence. |
