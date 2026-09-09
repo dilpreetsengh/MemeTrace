@@ -168,9 +168,12 @@ class CandidateFeedTests(unittest.TestCase):
         old.update({"source": "dexscreener", "age_minutes": 83_117})
         flat = dict(server.SAMPLE_CANDIDATES[0])
         flat.update({"source": "dexscreener", "price_change_5m_pct": 0})
+        seller_heavy = dict(server.SAMPLE_CANDIDATES[0])
+        seller_heavy.update({"source": "dexscreener", "buys_5m": 30, "sells_5m": 30})
 
         self.assertFalse(server.passes_dex_discovery_filter(old))
         self.assertFalse(server.passes_dex_discovery_filter(flat))
+        self.assertFalse(server.passes_dex_discovery_filter(seller_heavy))
 
     def test_dexscreener_filter_rejects_thin_pair(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
