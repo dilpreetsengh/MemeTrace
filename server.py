@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,13 @@ SOLANA_TRACKER_MAX_CHECKS = 3
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 COINGECKO_DEMO_API_KEY = os.getenv("COINGECKO_DEMO_API_KEY", "")
 COINGECKO_MAX_CHECKS = 3
+SOLANA_TRACKER_DISCOVERY_PATHS = (
+    "tokens/latest",
+    "tokens/trending/1h",
+    "tokens/multi/graduated",
+)
+SOLANA_TRACKER_DISCOVERY_MAX_PER_FEED = 15
+COINGECKO_DISCOVERY_PAGES = 2
 
 # Fictional fixtures let us review the first candidate feed before any live
 # market, quote, safety, or wallet provider is connected.
@@ -654,6 +662,212 @@ def refresh_dexscreener_candidates(fetcher=fetch_dexscreener_json, now: int | No
     }
 
 
+def fetch_solana_tracker_discovery(path: str) -> Any:
+    """Read a bounded token-discovery feed with the existing Solana Tracker key."""
+    if not SOLANA_TRACKER_API_KEY:
+        raise ValueError("SOLANA_TRACKER_API_KEY is not set.")
+    request = urllib.request.Request(
+        f"{SOLANA_TRACKER_API_BASE}/{path}",
+        headers={"User-Agent": "MemeTrace/0.1 research dashboard", "x-api-key": SOLANA_TRACKER_API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"Solana Tracker discovery returned HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach Solana Tracker discovery. Try again in a moment.") from exc
+
+
+def fetch_coingecko_new_pools(page: int) -> Any:
+    """Read one bounded page of new pools with the existing CoinGecko Demo key."""
+    if not COINGECKO_DEMO_API_KEY:
+        raise ValueError("COINGECKO_DEMO_API_KEY is not set.")
+    query = urllib.parse.urlencode({"include": "base_token", "page": page})
+    request = urllib.request.Request(
+        f"{COINGECKO_API_BASE}/onchain/networks/new_pools?{query}",
+        headers={"User-Agent": "MemeTrace/0.1 research dashboard", "x-cg-demo-api-key": COINGECKO_DEMO_API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"CoinGecko discovery returned HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach CoinGecko new-pools discovery. Try again in a moment.") from exc
+
+
+def value_at(data: dict[str, Any], *keys: str) -> Any:
+    """Read a nested provider field without assuming every new launch has every stat."""
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def created_age_minutes(value: Any, now: int) -> float:
+    if isinstance(value, (int, float)):
+        timestamp = float(value) / 1000 if value > 10_000_000_000 else float(value)
+        return max(0, (now - timestamp) / 60)
+    if isinstance(value, str):
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=timezone.utc).timestamp()
+            return max(0, (now - timestamp) / 60)
+        except ValueError:
+            return 0
+    return 0
+
+
+def normalize_solana_tracker_candidate(raw: dict[str, Any], now: int | None = None) -> dict[str, Any] | None:
+    """Convert one Tracker discovery record into the shared candidate shape."""
+    now = now or int(time.time())
+    token = raw.get("token") or raw
+    mint = token.get("mint") or token.get("address")
+    pools = raw.get("pools") or []
+    if not mint or not isinstance(pools, list) or not pools:
+        return None
+    pool = max(pools, key=lambda item: number(value_at(item, "liquidity", "usd")))
+    transactions = pool.get("txns") or {}
+    events = raw.get("events") or {}
+    return {
+        "mint": mint,
+        "name": token.get("name") or "Unknown token",
+        "symbol": token.get("symbol") or "UNKNOWN",
+        "chain": "solana",
+        "pair_address": pool.get("poolId") or pool.get("address"),
+        "source": "solanatracker",
+        "setup": "early_momentum",
+        "price_usd": number(value_at(pool, "price", "usd")),
+        "market_cap_usd": number(value_at(pool, "marketCap", "usd") or pool.get("marketCapUsd")),
+        "liquidity_usd": number(value_at(pool, "liquidity", "usd")),
+        "volume_5m_usd": number(value_at(events, "5m", "volume") or transactions.get("volume")),
+        "buys_5m": int(transactions.get("buys") or 0),
+        "sells_5m": int(transactions.get("sells") or 0),
+        "age_minutes": created_age_minutes(pool.get("createdAt") or value_at(token, "creation", "created_time"), now),
+        "price_change_5m_pct": number(value_at(events, "5m", "priceChangePercentage")),
+        "previous_high_market_cap_usd": None,
+        "sell_impact_pct": None,
+        "risk_flags": [],
+        "safety_status": "pending",
+        "observed_at": now,
+    }
+
+
+def normalize_coingecko_candidate(pool: dict[str, Any], included: dict[str, dict[str, Any]], now: int | None = None) -> dict[str, Any] | None:
+    """Convert a Solana CoinGecko new-pool response into the shared candidate shape."""
+    now = now or int(time.time())
+    relationships = pool.get("relationships") or {}
+    if value_at(relationships, "network", "data", "id") != "solana":
+        return None
+    base_token_id = value_at(relationships, "base_token", "data", "id")
+    token = included.get(base_token_id or "", {})
+    token_attributes = token.get("attributes") or {}
+    attributes = pool.get("attributes") or {}
+    mint = token_attributes.get("address")
+    if not mint or not attributes.get("address"):
+        return None
+    transactions = value_at(attributes, "transactions", "m5") or {}
+    return {
+        "mint": mint,
+        "name": token_attributes.get("name") or "Unknown token",
+        "symbol": token_attributes.get("symbol") or "UNKNOWN",
+        "chain": "solana",
+        "pair_address": attributes["address"],
+        "source": "coingecko",
+        "setup": "early_momentum",
+        "price_usd": number(attributes.get("base_token_price_usd")),
+        "market_cap_usd": number(attributes.get("market_cap_usd") or attributes.get("fdv_usd")),
+        "liquidity_usd": number(attributes.get("reserve_in_usd")),
+        "volume_5m_usd": number(value_at(attributes, "volume_usd", "m5")),
+        "buys_5m": int(transactions.get("buys") or 0),
+        "sells_5m": int(transactions.get("sells") or 0),
+        "age_minutes": created_age_minutes(attributes.get("pool_created_at"), now),
+        "price_change_5m_pct": number(value_at(attributes, "price_change_percentage", "m5")),
+        "previous_high_market_cap_usd": None,
+        "sell_impact_pct": None,
+        "risk_flags": [],
+        "safety_status": "pending",
+        "observed_at": now,
+    }
+
+
+def save_discovery_candidates(candidates: list[dict[str, Any]]) -> int:
+    """Keep the deepest-liquidity record for each mint before the later gated checks."""
+    strongest: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        if not passes_dex_discovery_filter(candidate):
+            continue
+        existing = strongest.get(candidate["mint"])
+        if existing is None or number(candidate["liquidity_usd"]) > number(existing["liquidity_usd"]):
+            strongest[candidate["mint"]] = candidate
+    conn = database()
+    for candidate in strongest.values():
+        upsert_candidate(candidate, conn)
+    conn.commit()
+    return len(strongest)
+
+
+def refresh_multi_source_candidates(
+    dex_refresh=refresh_dexscreener_candidates,
+    tracker_fetcher=fetch_solana_tracker_discovery,
+    coingecko_fetcher=fetch_coingecko_new_pools,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Merge bounded public DEX, Tracker, and CoinGecko discovery feeds before scoring."""
+    now = now or int(time.time())
+    providers: dict[str, dict[str, Any]] = {}
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        dex = dex_refresh(now=now)
+        providers["dexscreener"] = {"records_saved": dex["records_saved"], "status": "ok"}
+    except (UpstreamDataError, ValueError) as exc:
+        providers["dexscreener"] = {"records_saved": 0, "status": "unavailable", "note": str(exc)}
+
+    tracker_saved = 0
+    for path in SOLANA_TRACKER_DISCOVERY_PATHS:
+        try:
+            response = tracker_fetcher(path)
+            records = response if isinstance(response, list) else response.get("data") or response.get("tokens") or []
+            normalized = [normalize_solana_tracker_candidate(item, now) for item in records[:SOLANA_TRACKER_DISCOVERY_MAX_PER_FEED] if isinstance(item, dict)]
+            candidates.extend(item for item in normalized if item is not None)
+        except (UpstreamDataError, ValueError) as exc:
+            providers["solana_tracker"] = {"records_saved": tracker_saved, "status": "partial", "note": str(exc)}
+            break
+    else:
+        providers["solana_tracker"] = {"records_saved": 0, "status": "ok"}
+
+    tracker_saved = save_discovery_candidates([candidate for candidate in candidates if candidate["source"] == "solanatracker"])
+    providers["solana_tracker"]["records_saved"] = tracker_saved
+
+    coingecko_candidates: list[dict[str, Any]] = []
+    for page in range(1, COINGECKO_DISCOVERY_PAGES + 1):
+        try:
+            response = coingecko_fetcher(page)
+            included = {item.get("id"): item for item in response.get("included") or [] if isinstance(item, dict) and item.get("id")}
+            normalized = [normalize_coingecko_candidate(item, included, now) for item in response.get("data") or [] if isinstance(item, dict)]
+            coingecko_candidates.extend(item for item in normalized if item is not None)
+        except (UpstreamDataError, ValueError) as exc:
+            providers["coingecko"] = {"records_saved": 0, "status": "partial", "note": str(exc)}
+            break
+    else:
+        providers["coingecko"] = {"records_saved": 0, "status": "ok"}
+
+    coingecko_saved = save_discovery_candidates(coingecko_candidates)
+    providers["coingecko"]["records_saved"] = coingecko_saved
+
+    total_saved = sum(number(provider.get("records_saved")) for provider in providers.values())
+    return {
+        "source": "multi_source",
+        "refreshed_at": now,
+        "records_saved": int(total_saved),
+        "providers": providers,
+        "note": "Bounded DEX Screener, Solana Tracker, and CoinGecko discovery. Cards still must pass sellability and safety gates.",
+    }
+
+
 class JupiterNoRouteError(UpstreamDataError):
     """Jupiter did not return a route for a bounded research-only sell quote."""
 
@@ -694,16 +908,43 @@ def jupiter_token_metadata(mint: str, fetcher=fetch_jupiter_json) -> dict[str, A
     return next((record for record in records if record.get("address") == mint), None)
 
 
-def check_jupiter_sell_quote(candidate: dict[str, Any], fetcher=fetch_jupiter_json) -> dict[str, Any]:
+def fetch_helius_mint_decimals(mint: str) -> int:
+    """Use public Solana mint data as a fallback when a fresh token is not indexed by Jupiter yet."""
+    if not HELIUS_KEY:
+        raise ValueError("HELIUS_API_KEY is not set, so mint decimals could not be checked.")
+    url = f"https://mainnet.helius-rpc.com/?{urllib.parse.urlencode({'api-key': HELIUS_KEY})}"
+    body = json.dumps({"jsonrpc": "2.0", "id": "memetrace-decimals", "method": "getTokenSupply", "params": [mint]}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "MemeTrace/0.1 research dashboard"})
+    try:
+        wait_for_helius_rate_limit()
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        decimals = value_at(data, "result", "value", "decimals")
+        if decimals is None:
+            raise UpstreamDataError("Helius did not return mint decimals for this token.")
+        return int(decimals)
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"Helius decimal fallback returned HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("HELIUS_API_KEY"):
+            raise
+        raise UpstreamDataError("Could not read public mint decimals from Helius.") from exc
+
+
+def check_jupiter_sell_quote(candidate: dict[str, Any], fetcher=fetch_jupiter_json,
+                             decimal_fallback=fetch_helius_mint_decimals) -> dict[str, Any]:
     """Ask Jupiter whether a roughly $5 token sell has a route; no wallet is used."""
     price_usd = number(candidate.get("price_usd"))
     if price_usd <= 0:
         return {"status": "unavailable", "note": "DEX Screener did not provide a usable USD price for this pair.", "impact_pct": None}
     try:
         metadata = jupiter_token_metadata(candidate["mint"], fetcher)
-        if not metadata or metadata.get("decimals") is None:
-            return {"status": "unavailable", "note": "Jupiter did not return token decimals for this mint.", "impact_pct": None}
-        raw_amount = max(1, round((JUPITER_TEST_SELL_USD / price_usd) * (10 ** int(metadata["decimals"]))))
+        decimals = metadata.get("decimals") if metadata else None
+        decimal_source = "Jupiter"
+        if decimals is None:
+            decimals = decimal_fallback(candidate["mint"])
+            decimal_source = "Helius fallback"
+        raw_amount = max(1, round((JUPITER_TEST_SELL_USD / price_usd) * (10 ** int(decimals))))
         query = urllib.parse.urlencode({
             "inputMint": candidate["mint"],
             "outputMint": SOL_MINT,
@@ -717,7 +958,7 @@ def check_jupiter_sell_quote(candidate: dict[str, Any], fetcher=fetch_jupiter_js
         impact_pct = number(quote.get("priceImpactPct"))
         return {
             "status": "pass",
-            "note": f"Jupiter returned a route for a roughly ${JUPITER_TEST_SELL_USD} test sell.",
+            "note": f"Jupiter returned a route for a roughly ${JUPITER_TEST_SELL_USD} test sell ({decimal_source} decimals).",
             "impact_pct": impact_pct,
         }
     except JupiterNoRouteError as exc:
@@ -1118,7 +1359,7 @@ def build_full_scan_summary(stages: dict[str, dict[str, Any]], feed: dict[str, A
 
 
 def run_full_research_scan(
-    discovery=refresh_dexscreener_candidates,
+    discovery=refresh_multi_source_candidates,
     quote_check=enrich_jupiter_sellability,
     safety_check=enrich_solana_tracker_risk,
     wallet_check=enrich_helius_wallet_evidence,
@@ -1273,7 +1514,7 @@ class Handler(SimpleHTTPRequestHandler):
         path, _, _ = self.path.partition("?")
         try:
             if path == "/api/candidates/refresh":
-                return self.json_response(200, refresh_dexscreener_candidates())
+                return self.json_response(200, refresh_multi_source_candidates())
             if path == "/api/candidates/full-scan":
                 return self.json_response(200, run_full_research_scan())
             if path == "/api/candidates/quote-check":
