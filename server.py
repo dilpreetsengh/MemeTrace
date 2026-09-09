@@ -47,7 +47,10 @@ DEX_DISCOVERY_MIN_MARKET_CAP_USD = 75_000
 DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
 DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
 DEX_DISCOVERY_MIN_AGE_MINUTES = 5
+DEX_DISCOVERY_MAX_AGE_MINUTES = 7 * 24 * 60
 DEX_DISCOVERY_MIN_5M_VOLUME_USD = 1_000
+DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT = 2
+LIVE_CANDIDATE_TTL_SECONDS = 30 * 60
 JUPITER_API_BASE = "https://api.jup.ag"
 JUPITER_TEST_SELL_USD = 5
 JUPITER_MAX_QUOTES_PER_CHECK = 3
@@ -63,7 +66,7 @@ SOLANA_TRACKER_DISCOVERY_PATHS = (
     "tokens/trending/1h",
     "tokens/multi/graduated",
 )
-SOLANA_TRACKER_DISCOVERY_MAX_PER_FEED = 15
+SOLANA_TRACKER_DISCOVERY_MAX_TOKENS = 24
 COINGECKO_DISCOVERY_PAGES = 2
 
 # Fictional fixtures let us review the first candidate feed before any live
@@ -415,8 +418,14 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         gates.append({"label": "Safety / cluster flags", "status": "PENDING", "detail": "Live safety check still required."})
         warnings.append("A live safety check is required before a real coin can be labeled Candidate.")
 
+    momentum_confirmed = source == "sample" or price_change >= DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT
+    if source != "sample" and not momentum_confirmed:
+        warnings.append("Five-minute price momentum is below the minimum for a fresh trending candidate.")
+
     score = max(0, min(100, round(score)))
-    eligible_for_candidate = source == "sample" or (safety_status == "pass" and crosscheck_status == "pass")
+    eligible_for_candidate = source == "sample" or (
+        safety_status == "pass" and crosscheck_status == "pass" and momentum_confirmed
+    )
     if hard_failures:
         status = "avoid"
     elif score >= 75 and eligible_for_candidate:
@@ -463,12 +472,14 @@ def serialize_candidate(row: sqlite3.Row) -> dict[str, Any]:
 def candidate_feed(status: str | None = None, limit: int = 50) -> dict[str, Any]:
     """Return explainable candidates, sorted by research status and score."""
     conn = database()
+    fresh_cutoff = int(time.time()) - LIVE_CANDIDATE_TTL_SECONDS
     has_live_records = conn.execute(
-        "SELECT EXISTS(SELECT 1 FROM candidates WHERE source != 'sample')"
+        "SELECT EXISTS(SELECT 1 FROM candidates WHERE source != 'sample' AND observed_at >= ?)", (fresh_cutoff,)
     ).fetchone()[0]
-    where = "WHERE source != 'sample'" if has_live_records else ""
+    where = "WHERE source != 'sample' AND observed_at >= ?" if has_live_records else ""
+    query_params: tuple[Any, ...] = (fresh_cutoff, limit) if has_live_records else (limit,)
     rows = conn.execute(
-        f"SELECT * FROM candidates {where} ORDER BY observed_at DESC LIMIT ?", (limit,)
+        f"SELECT * FROM candidates {where} ORDER BY observed_at DESC LIMIT ?", query_params
     ).fetchall()
     candidates = [serialize_candidate(row) for row in rows]
     if status:
@@ -565,9 +576,10 @@ def passes_dex_discovery_filter(candidate: dict[str, Any]) -> bool:
     return (
         DEX_DISCOVERY_MIN_MARKET_CAP_USD <= market_cap <= DEX_DISCOVERY_MAX_MARKET_CAP_USD
         and number(candidate["liquidity_usd"]) >= DEX_DISCOVERY_MIN_LIQUIDITY_USD
-        and number(candidate["age_minutes"]) >= DEX_DISCOVERY_MIN_AGE_MINUTES
+        and DEX_DISCOVERY_MIN_AGE_MINUTES <= number(candidate["age_minutes"]) <= DEX_DISCOVERY_MAX_AGE_MINUTES
         and number(candidate["volume_5m_usd"]) >= DEX_DISCOVERY_MIN_5M_VOLUME_USD
         and int(candidate["buys_5m"]) + int(candidate["sells_5m"]) >= 5
+        and number(candidate["price_change_5m_pct"]) >= DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT
     )
 
 
@@ -742,7 +754,7 @@ def normalize_solana_tracker_candidate(raw: dict[str, Any], now: int | None = No
         "price_usd": number(value_at(pool, "price", "usd")),
         "market_cap_usd": number(value_at(pool, "marketCap", "usd") or pool.get("marketCapUsd")),
         "liquidity_usd": number(value_at(pool, "liquidity", "usd")),
-        "volume_5m_usd": number(value_at(events, "5m", "volume") or transactions.get("volume")),
+        "volume_5m_usd": number(value_at(events, "5m", "volume")),
         "buys_5m": int(transactions.get("buys") or 0),
         "sells_5m": int(transactions.get("sells") or 0),
         "age_minutes": created_age_minutes(pool.get("createdAt") or value_at(token, "creation", "created_time"), now),
@@ -809,16 +821,24 @@ def save_discovery_candidates(candidates: list[dict[str, Any]]) -> int:
     return len(strongest)
 
 
+def mark_live_candidates_stale() -> None:
+    """Keep history in SQLite, but remove old scan cards from the active research feed."""
+    conn = database()
+    conn.execute("UPDATE candidates SET observed_at=0 WHERE source != 'sample'")
+    conn.commit()
+
+
 def refresh_multi_source_candidates(
     dex_refresh=refresh_dexscreener_candidates,
     tracker_fetcher=fetch_solana_tracker_discovery,
     coingecko_fetcher=fetch_coingecko_new_pools,
+    dex_pair_fetcher=fetch_dexscreener_json,
     now: int | None = None,
 ) -> dict[str, Any]:
     """Merge bounded public DEX, Tracker, and CoinGecko discovery feeds before scoring."""
     now = now or int(time.time())
     providers: dict[str, dict[str, Any]] = {}
-    candidates: list[dict[str, Any]] = []
+    mark_live_candidates_stale()
 
     try:
         dex = dex_refresh(now=now)
@@ -826,20 +846,43 @@ def refresh_multi_source_candidates(
     except (UpstreamDataError, ValueError) as exc:
         providers["dexscreener"] = {"records_saved": 0, "status": "unavailable", "note": str(exc)}
 
-    tracker_saved = 0
+    tracker_mints: list[str] = []
     for path in SOLANA_TRACKER_DISCOVERY_PATHS:
         try:
             response = tracker_fetcher(path)
             records = response if isinstance(response, list) else response.get("data") or response.get("tokens") or []
-            normalized = [normalize_solana_tracker_candidate(item, now) for item in records[:SOLANA_TRACKER_DISCOVERY_MAX_PER_FEED] if isinstance(item, dict)]
-            candidates.extend(item for item in normalized if item is not None)
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                token = item.get("token") or item
+                mint = token.get("mint") or token.get("address")
+                if mint and mint not in tracker_mints:
+                    tracker_mints.append(mint)
+                if len(tracker_mints) >= SOLANA_TRACKER_DISCOVERY_MAX_TOKENS:
+                    break
+            if len(tracker_mints) >= SOLANA_TRACKER_DISCOVERY_MAX_TOKENS:
+                break
         except (UpstreamDataError, ValueError) as exc:
-            providers["solana_tracker"] = {"records_saved": tracker_saved, "status": "partial", "note": str(exc)}
+            providers["solana_tracker"] = {"records_saved": 0, "status": "partial", "note": str(exc)}
             break
     else:
         providers["solana_tracker"] = {"records_saved": 0, "status": "ok"}
 
-    tracker_saved = save_discovery_candidates([candidate for candidate in candidates if candidate["source"] == "solanatracker"])
+    tracker_candidates: list[dict[str, Any]] = []
+    for mint in tracker_mints:
+        try:
+            pairs = dex_pair_fetcher(f"{DEX_SCREENER_API_BASE}/token-pairs/v1/solana/{urllib.parse.quote(mint)}")
+            if not isinstance(pairs, list):
+                continue
+            tracker_candidates.extend(
+                candidate for candidate in (normalize_dexscreener_pair(pair, now) for pair in pairs if isinstance(pair, dict))
+                if candidate is not None
+            )
+        except UpstreamDataError:
+            continue
+    if "solana_tracker" not in providers:
+        providers["solana_tracker"] = {"records_saved": 0, "status": "ok"}
+    tracker_saved = save_discovery_candidates(tracker_candidates)
     providers["solana_tracker"]["records_saved"] = tracker_saved
 
     coingecko_candidates: list[dict[str, Any]] = []
@@ -980,9 +1023,9 @@ def enrich_jupiter_sellability(fetcher=fetch_jupiter_json, now: int | None = Non
     now = now or int(time.time())
     conn = database()
     rows = conn.execute(
-        """SELECT * FROM candidates WHERE source != 'sample'
+        """SELECT * FROM candidates WHERE source != 'sample' AND observed_at >= ?
            ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
-        (JUPITER_MAX_QUOTES_PER_CHECK,),
+        (now - LIVE_CANDIDATE_TTL_SECONDS, JUPITER_MAX_QUOTES_PER_CHECK),
     ).fetchall()
     summary = {"checked": 0, "sellable": 0, "no_route": 0, "unavailable": 0}
     for row in rows:
@@ -1062,9 +1105,9 @@ def enrich_solana_tracker_risk(fetcher=fetch_solana_tracker_token, now: int | No
     now = now or int(time.time())
     conn = database()
     rows = conn.execute(
-        """SELECT * FROM candidates WHERE source != 'sample' AND sell_quote_status='pass'
+        """SELECT * FROM candidates WHERE source != 'sample' AND observed_at >= ? AND sell_quote_status='pass'
            ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
-        (SOLANA_TRACKER_MAX_CHECKS,),
+        (now - LIVE_CANDIDATE_TTL_SECONDS, SOLANA_TRACKER_MAX_CHECKS),
     ).fetchall()
     summary = {"checked": 0, "clean": 0, "flagged": 0, "unavailable": 0}
     for row in rows:
@@ -1182,9 +1225,9 @@ def enrich_helius_wallet_evidence(asset_fetcher=fetch_helius_asset, transaction_
     now = now or int(time.time())
     conn = database()
     rows = conn.execute(
-        """SELECT * FROM candidates WHERE source != 'sample' AND sell_quote_status='pass'
+        """SELECT * FROM candidates WHERE source != 'sample' AND observed_at >= ? AND sell_quote_status='pass'
            AND safety_status='tracker_pass' ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
-        (SOLANA_TRACKER_MAX_CHECKS,),
+        (now - LIVE_CANDIDATE_TTL_SECONDS, SOLANA_TRACKER_MAX_CHECKS),
     ).fetchall()
     summary = {"checked": 0, "clear": 0, "flagged": 0, "unavailable": 0}
     for row in rows:
@@ -1269,9 +1312,9 @@ def enrich_coingecko_crosscheck(fetcher=fetch_coingecko_pool, now: int | None = 
     now = now or int(time.time())
     conn = database()
     rows = conn.execute(
-        """SELECT * FROM candidates WHERE source != 'sample' AND sell_quote_status='pass'
+        """SELECT * FROM candidates WHERE source != 'sample' AND observed_at >= ? AND sell_quote_status='pass'
            AND safety_status='pass' ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
-        (COINGECKO_MAX_CHECKS,),
+        (now - LIVE_CANDIDATE_TTL_SECONDS, COINGECKO_MAX_CHECKS),
     ).fetchall()
     summary = {"checked": 0, "consistent": 0, "mismatched": 0, "unavailable": 0}
     for row in rows:
@@ -1320,6 +1363,16 @@ def build_full_scan_summary(stages: dict[str, dict[str, Any]], feed: dict[str, A
                 "top_candidate": None,
             }
 
+    if not discovery.get("records_saved"):
+        return {
+            "headline": "No fresh trending cards this scan",
+            "detail": "No new pair passed the fresh age, real five-minute activity, liquidity, and momentum filters. Sample cards are not live results.",
+            "candidate_count": 0,
+            "watch_count": 0,
+            "avoid_count": 0,
+            "top_candidate": None,
+        }
+
     finalists = [card for card in feed["candidates"] if card["status"] == "candidate"]
     if finalists:
         top = finalists[0]
@@ -1335,9 +1388,7 @@ def build_full_scan_summary(stages: dict[str, dict[str, Any]], feed: dict[str, A
             "top_candidate": {"mint": top["mint"], "name": top["name"], "symbol": top["symbol"], "score": top["score"]},
         }
 
-    if not discovery.get("records_saved"):
-        detail = "No new Solana pairs passed the starter market-cap, liquidity, age, volume, and activity filters."
-    elif not quotes.get("sellable"):
+    if not quotes.get("sellable"):
         detail = "No scanned card had a usable small Jupiter sell route, so later checks were skipped to protect API limits."
     elif not safety.get("clean"):
         detail = "Sellable cards were found, but none passed the configured Solana Tracker safety gate."
