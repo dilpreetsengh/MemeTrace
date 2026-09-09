@@ -141,7 +141,14 @@ footer { color: var(--muted); }
   color: #c3cee6;
 }
 
-.hero > button {
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.hero-actions > button {
   flex: 0 0 auto;
   border: 0;
   border-radius: 10px;
@@ -151,8 +158,14 @@ footer { color: var(--muted); }
   font-weight: 800;
 }
 
-.hero > button:hover { filter: brightness(1.08); }
-.hero > button:disabled { cursor: wait; opacity: .65; }
+.hero-actions > button:hover { filter: brightness(1.08); }
+.hero-actions > button:disabled { cursor: wait; opacity: .65; }
+
+.hero-actions > button.secondary {
+  border: 1px solid #47638e;
+  color: #dce8ff;
+  background: #1a2a49;
+}
 
 .metrics {
   display: grid;
