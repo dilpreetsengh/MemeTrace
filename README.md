@@ -7,6 +7,21 @@ risks behind each card.
 It is not an auto-buy bot, does not connect a wallet, and does not make trading
 recommendations.
 
+### Tune research filters from the dashboard
+
+Open **Research filters** at the top of the dashboard to change the scanner
+without editing Python. The setting panel has a switch for each local research
+gate plus its lower/upper limit where applicable. It covers discovery (market
+cap, age, liquidity, five-minute activity, buy pressure, momentum), candidate
+and exit quality, plus the public holder/creator thresholds used in Solana
+Tracker and Helius checks.
+
+Click **Save filters** and then run a new scan. Settings persist locally in
+`research_filters.json`, which is intentionally ignored by Git. **Reset starter
+defaults** restores the original strict settings. Switching a gate off changes
+only the research label; it does not make a token safer, prove liquidity, or
+create a buy instruction. Raw provider danger flags remain visible.
+
 ## What works now
 
 The first product feature is a local **Qualified Candidates** feed:
@@ -119,6 +134,9 @@ python3 -m unittest -v
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Confirms local database setup and counts saved records. |
+| `GET /api/research-filters` | Returns the active local research-filter settings and starter defaults. |
+| `POST /api/research-filters` | Saves the dashboard's local research filters. |
+| `POST /api/research-filters/reset` | Restores the strict starter filter settings. |
 | `GET /api/candidates` | Returns the ranked candidate feed. |
 | `POST /api/candidates/full-scan` | Runs DEX Screener discovery, then the bounded Jupiter, Solana Tracker, Helius, and CoinGecko checks in order and returns one research-only final summary. |
 | `POST /api/candidates/lookup` | Accepts `{ "address": "<Solana mint>" }`, loads that token's active Solana pair, and runs the available checks on that exact token. |
