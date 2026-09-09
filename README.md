@@ -17,8 +17,13 @@ The first product feature is a local **Qualified Candidates** feed:
 - Shows why it appeared, the hard risk gates, and what still needs checking.
 - Provides a small local API for the dashboard.
 
-The initial cards are fictional sample fixtures. They exist so we can review
-the rules and dashboard before connecting live providers.
+The initial cards are fictional sample fixtures. Click **Get live Solana pairs**
+in the dashboard to replace them with a deliberately small public DEX Screener
+discovery pass. No DEX Screener account or key is needed for this step.
+
+Live cards are deliberately limited to `Watch`: DEX Screener can provide public
+pair data, but we have not yet connected a Jupiter sell quote or token-safety
+screen. The app therefore cannot turn public discovery data into a trade prompt.
 
 ## Run it
 
@@ -43,6 +48,7 @@ python3 -m unittest -v
 | --- | --- |
 | `GET /api/health` | Confirms local database setup and counts saved records. |
 | `GET /api/candidates` | Returns the ranked candidate feed. |
+| `POST /api/candidates/refresh` | Pulls a small set of public Solana token profiles and qualifying pairs from DEX Screener. |
 | `GET /api/candidates?status=watch` | Filters the feed to one label. |
 | `GET /api/candidates/<mint>` | Returns one candidate and its saved snapshots. |
 | `GET /api/cohorts` | Existing public early-buyer co-buy research report. |
@@ -63,12 +69,17 @@ Live records whose safety check is still pending can be shown as `Watch`, but
 cannot become a `Candidate`. Sample fixtures are the only temporary exception,
 and the dashboard labels them clearly.
 
+## Current discovery rules
+
+The DEX Screener refresh considers only a small public Solana shortlist, then
+keeps pairs that are at least five minutes old with roughly $75k–$3m market cap,
+$25k liquidity, $1k five-minute volume, and at least five recent swaps. These
+are discovery filters, not quality or safety proof.
+
 ## Next build step
 
-Replace the fictional feed with a DEX Screener collector. It will add or update
-candidate records from public Solana pair data; then we will enrich only the
-shortlist with Jupiter sell quotes, token-risk checks, and public wallet
-evidence.
+Add Jupiter sell quotes to the live shortlist. Then we will enrich only the
+remaining cards with token-risk checks and public wallet evidence.
 
 ## Safety rules
 
