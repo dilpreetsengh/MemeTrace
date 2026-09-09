@@ -80,6 +80,24 @@ class CandidateFeedTests(unittest.TestCase):
         candidate.update({"liquidity_usd": 24_999, "age_minutes": 10, "volume_5m_usd": 2_000})
         self.assertFalse(server.passes_dex_discovery_filter(candidate))
 
+    def test_fresh_dex_refresh_invalidates_old_quote_and_safety_evidence(self):
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"mint": "FreshnessMint111111111111111111111111111111111", "source": "dexscreener", "price_usd": 0.02, "observed_at": 1_800_000_000})
+        conn = server.database()
+        server.upsert_candidate(candidate, conn)
+        conn.execute("""UPDATE candidates SET sell_quote_status='pass', sell_impact_pct=0.4,
+          safety_status='pass', crosscheck_status='pass', risk_flags_json='[\"old flag\"]' WHERE mint=?""", (candidate["mint"],))
+        candidate["price_usd"] = 0.03
+        candidate["observed_at"] += 60
+        server.upsert_candidate(candidate, conn)
+        conn.commit()
+        refreshed = conn.execute("SELECT * FROM candidates WHERE mint=?", (candidate["mint"],)).fetchone()
+
+        self.assertEqual(refreshed["sell_quote_status"], "pending")
+        self.assertIsNone(refreshed["sell_impact_pct"])
+        self.assertEqual(refreshed["safety_status"], "pending")
+        self.assertEqual(refreshed["crosscheck_status"], "pending")
+
     def test_jupiter_sell_quote_is_saved_without_creating_a_transaction(self):
         now = 1_800_000_000
         candidate = dict(server.SAMPLE_CANDIDATES[0])
@@ -127,6 +145,122 @@ class CandidateFeedTests(unittest.TestCase):
 
         self.assertEqual(quote["status"], "no_route")
         self.assertEqual(assessment["status"], "avoid")
+
+    def test_solana_tracker_danger_flag_is_saved_as_avoid(self):
+        now = 1_800_000_000
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({
+            "mint": "TrackerTestMint111111111111111111111111111111", "source": "dexscreener",
+            "safety_status": "pending", "price_usd": 0.02, "observed_at": now,
+        })
+        conn = server.database()
+        server.upsert_candidate(candidate, conn)
+        conn.execute("UPDATE candidates SET sell_quote_status='pass', sell_impact_pct=0.8 WHERE mint=?", (candidate["mint"],))
+        conn.commit()
+
+        def fake_fetcher(mint):
+            self.assertEqual(mint, candidate["mint"])
+            return {"risk": {"score": 7.4, "rugged": False, "risks": [
+                {"name": "Freeze Authority Enabled", "description": "Creator can freeze tokens.", "level": "danger"},
+            ]}}
+
+        result = server.enrich_solana_tracker_risk(fetcher=fake_fetcher, now=now)
+        live = server.candidate_feed()["candidates"][0]
+
+        self.assertEqual(result["flagged"], 1)
+        self.assertEqual(live["safety_status"], "avoid")
+        self.assertEqual(live["safety_score"], 7.4)
+        self.assertEqual(live["status"], "avoid")
+        self.assertIn("Freeze Authority Enabled", live["risk_flags"][0])
+
+    def test_solana_tracker_clean_result_waits_for_wallet_evidence(self):
+        result = server.interpret_solana_tracker_risk({"risk": {"score": 2, "rugged": False, "risks": []}})
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"source": "dexscreener", "safety_status": result["status"], "safety_note": result["note"]})
+
+        assessment = server.candidate_assessment(candidate)
+
+        self.assertEqual(result["status"], "tracker_pass")
+        self.assertEqual(assessment["status"], "watch")
+        self.assertTrue(any(gate["label"] == "Safety / cluster flags" and gate["status"] == "WATCH" for gate in assessment["gates"]))
+
+    def test_helius_public_wallet_evidence_completes_the_safety_gate(self):
+        now = 1_800_000_000
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({
+            "mint": "HeliusTestMint1111111111111111111111111111111", "source": "dexscreener",
+            "safety_status": "tracker_pass", "price_usd": 0.02, "observed_at": now,
+        })
+        conn = server.database()
+        server.upsert_candidate(candidate, conn)
+        conn.execute("UPDATE candidates SET sell_quote_status='pass', sell_impact_pct=0.8, safety_status='tracker_pass' WHERE mint=?", (candidate["mint"],))
+        conn.commit()
+        creator = "Creator111111111111111111111111111111111111"
+
+        def fake_asset_fetcher(mint):
+            self.assertEqual(mint, candidate["mint"])
+            return {"creators": [{"address": creator, "verified": True}], "authorities": [],
+                    "token_info": {"mint_authority": None, "freeze_authority": None}}
+
+        def fake_transactions(address):
+            self.assertEqual(address, creator)
+            return [{"tokenTransfers": [{"mint": candidate["mint"], "fromUserAccount": creator, "toUserAccount": "Elsewhere"}]}]
+
+        result = server.enrich_helius_wallet_evidence(fake_asset_fetcher, fake_transactions, now)
+        live = server.candidate_feed()["candidates"][0]
+
+        self.assertEqual(result["clear"], 1)
+        self.assertEqual(live["safety_status"], "pass")
+        self.assertEqual(live["creator_address"], creator)
+        self.assertEqual(live["wallet_evidence"]["recent_token_outflows_from_observed_address"], 1)
+        self.assertEqual(live["status"], "watch")  # CoinGecko cross-check is still required.
+
+    def test_helius_active_mint_authority_is_a_hard_flag(self):
+        result = server.interpret_helius_wallet_evidence(
+            {"creators": [], "authorities": [], "token_info": {"mint_authority": "ActiveMint", "freeze_authority": None}},
+            [],
+            "test-mint",
+        )
+
+        self.assertEqual(result["status"], "avoid")
+        self.assertIn("mint authority", result["flags"][0])
+
+    def test_coingecko_consistent_pool_data_completes_final_candidate_gate(self):
+        now = 1_800_000_000
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({
+            "mint": "GeckoTestMint11111111111111111111111111111111", "source": "dexscreener",
+            "safety_status": "pass", "price_usd": 0.02, "liquidity_usd": 60_000,
+            "pair_address": "GeckoTestPair111", "observed_at": now,
+        })
+        conn = server.database()
+        server.upsert_candidate(candidate, conn)
+        conn.execute("UPDATE candidates SET sell_quote_status='pass', sell_impact_pct=0.8, safety_status='pass' WHERE mint=?", (candidate["mint"],))
+        conn.commit()
+
+        def fake_fetcher(pair_address):
+            self.assertEqual(pair_address, candidate["pair_address"])
+            return {"attributes": {"base_token_price_usd": "0.019", "reserve_in_usd": "57_000"}}
+
+        result = server.enrich_coingecko_crosscheck(fetcher=fake_fetcher, now=now)
+        live = server.candidate_feed()["candidates"][0]
+
+        self.assertEqual(result["consistent"], 1)
+        self.assertEqual(live["crosscheck_status"], "pass")
+        self.assertEqual(live["crosscheck_price_usd"], 0.019)
+        self.assertEqual(live["status"], "candidate")
+
+    def test_coingecko_large_price_gap_keeps_card_watch(self):
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"source": "dexscreener", "price_usd": 0.02, "liquidity_usd": 60_000})
+        result = server.interpret_coingecko_pool(candidate, {"attributes": {"base_token_price_usd": "0.01", "reserve_in_usd": "60_000"}})
+        candidate.update({"safety_status": "pass", "sell_quote_status": "pass", "sell_impact_pct": 0.8,
+                          "crosscheck_status": result["status"], "crosscheck_note": result["note"]})
+
+        assessment = server.candidate_assessment(candidate)
+
+        self.assertEqual(result["status"], "mismatch")
+        self.assertEqual(assessment["status"], "watch")
 
 
 if __name__ == "__main__":
