@@ -141,6 +141,13 @@ footer { color: var(--muted); }
   color: #c3cee6;
 }
 
+.hero .scan-summary {
+  margin-top: 14px;
+  color: #dce8ff;
+  font-size: 13px;
+  font-weight: 650;
+}
+
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
