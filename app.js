@@ -284,9 +284,19 @@ async function refreshCandidates() {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Live refresh returned ' + response.status);
     await loadCandidates({ keepButtonDisabled: true });
+    const coverage = result.coverage || {};
+    const nearMisses = (coverage.common_failures || [])
+      .map((item) => item.label + ' (' + item.count + ')').join(', ');
     elements.dataStatus.textContent = result.records_saved
       ? 'Loaded ' + result.records_saved + ' live research cards'
-      : 'No pairs passed the starter filter yet';
+      : (coverage.pairs_seen
+        ? 'Checked ' + coverage.pairs_seen + ' current pairs · none passed every starter rule'
+        : 'No usable current pair data returned yet');
+    if (!result.records_saved && coverage.pairs_seen) {
+      elements.note.textContent = nearMisses
+        ? 'Most common near-miss gates: ' + nearMisses + '.'
+        : 'No pair passed every starter rule in this scan.';
+    }
   } catch (error) {
     elements.dataStatus.textContent = 'Live refresh unavailable';
     elements.note.textContent = error.message;
