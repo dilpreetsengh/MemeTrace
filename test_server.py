@@ -189,6 +189,12 @@ class CandidateFeedTests(unittest.TestCase):
         candidate.update({"liquidity_usd": 24_999, "age_minutes": 10, "volume_5m_usd": 2_000})
         self.assertFalse(server.passes_dex_discovery_filter(candidate))
 
+    def test_dexscreener_filter_accepts_the_70k_market_cap_floor(self):
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"source": "dexscreener", "market_cap_usd": 70_000})
+
+        self.assertTrue(server.passes_dex_discovery_filter(candidate))
+
     def test_fresh_dex_refresh_invalidates_old_quote_and_safety_evidence(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
         candidate.update({"mint": "FreshnessMint111111111111111111111111111111111", "source": "dexscreener", "price_usd": 0.02, "observed_at": 1_800_000_000})
