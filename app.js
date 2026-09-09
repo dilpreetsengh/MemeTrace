@@ -173,12 +173,20 @@ function renderDetail() {
     ? '<p class="sample-note">This is fictional sample data. It does not mean the checks passed for a real token.</p>'
     : '';
   const walletEvidence = candidate.wallet_evidence || {};
+  const riskEvidence = candidate.risk_evidence || {};
+  const trackerMetrics = riskEvidence.risk_score === undefined ? '' :
+    ' · top 10 ' + formatPercent(riskEvidence.top_10_holder_pct) +
+    ' · dev ' + formatPercent(riskEvidence.developer_holder_pct) +
+    ' · insiders ' + formatPercent(riskEvidence.insider_holder_pct) +
+    ' · bundlers ' + formatPercent(riskEvidence.bundler_holder_pct) +
+    ' · snipers ' + formatPercent(riskEvidence.sniper_holder_pct) +
+    ' · LP/curve: ' + escapeHtml(riskEvidence.lp_or_curve_status || 'not returned');
   const providerEvidence = candidate.source === 'sample' ? '' :
     '<section class="detail-section"><h3>Provider evidence</h3><ul class="detail-list">' +
       '<li><b>Jupiter:</b> ' + escapeHtml(candidate.sell_quote_status || 'pending') +
         (candidate.sell_quote_note ? ' — ' + escapeHtml(candidate.sell_quote_note) : '') + '</li>' +
       '<li><b>Solana Tracker:</b> ' + escapeHtml(candidate.safety_status || 'pending') +
-        (candidate.safety_score !== null && candidate.safety_score !== undefined ? ' · risk score ' + escapeHtml(candidate.safety_score) + '/10' : '') + '</li>' +
+        (candidate.safety_score !== null && candidate.safety_score !== undefined ? ' · risk score ' + escapeHtml(candidate.safety_score) + '/10' : '') + trackerMetrics + '</li>' +
       '<li><b>Helius:</b> public creator/authority ' + escapeHtml(shortAddress(candidate.creator_address)) +
         (walletEvidence.recent_token_outflows_from_observed_address !== undefined ? ' · observed token outflows ' + escapeHtml(walletEvidence.recent_token_outflows_from_observed_address) : '') + '</li>' +
       '<li><b>CoinGecko:</b> ' + escapeHtml(candidate.crosscheck_status || 'pending') +
@@ -318,7 +326,7 @@ async function checkTokenSafety() {
     if (!response.ok) throw new Error(result.error || 'Safety check returned ' + response.status);
     await loadCandidates({ keepButtonDisabled: true });
     elements.dataStatus.textContent = result.checked
-      ? 'Checked ' + result.checked + ' tokens · ' + result.flagged + ' risk flags'
+      ? 'Checked ' + result.checked + ' tokens · ' + result.flagged + ' avoids · ' + (result.watch || 0) + ' watch warnings'
       : (result.note || '').includes('SOLANA_TRACKER_API_KEY')
         ? 'Safety-check setup needed'
         : 'No sellable cards to safety-check';
