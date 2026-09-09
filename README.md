@@ -21,9 +21,9 @@ The initial cards are fictional sample fixtures. Click **Get live Solana pairs**
 in the dashboard to replace them with a deliberately small public DEX Screener
 discovery pass. No DEX Screener account or key is needed for this step.
 
-Live cards are deliberately limited to `Watch`: DEX Screener can provide public
-pair data, but we have not yet connected a Jupiter sell quote or token-safety
-screen. The app therefore cannot turn public discovery data into a trade prompt.
+Live cards are deliberately limited to `Watch`: a Jupiter sell route is useful
+evidence but a token-safety screen is still required. The app therefore cannot
+turn public discovery data into a trade prompt.
 
 ## Run it
 
@@ -35,6 +35,21 @@ python3 server.py
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080).
+
+### Optional: enable real sell-route checks
+
+The **Check sell routes** button uses Jupiter's public quote and token-metadata
+APIs. It never connects a wallet, creates a transaction, signs anything, or
+spends funds. Jupiter requires a free developer API key for the token metadata
+needed to calculate a roughly $5 token sell in atomic units.
+
+1. Create a free key in the [Jupiter developer portal](https://developers.jup.ag/portal).
+2. In the project folder, copy `.env.example` to a new file named `.env`.
+3. Replace only the value after `JUPITER_API_KEY=` in `.env`.
+4. Stop and restart `python3 server.py` (on Windows, use `py server.py`).
+
+Do not paste the key into ChatGPT or commit `.env` to GitHub. The check uses at
+most three saved live cards per click to respect the free API rate limit.
 
 ## Test it
 
@@ -49,6 +64,7 @@ python3 -m unittest -v
 | `GET /api/health` | Confirms local database setup and counts saved records. |
 | `GET /api/candidates` | Returns the ranked candidate feed. |
 | `POST /api/candidates/refresh` | Pulls a small set of public Solana token profiles and qualifying pairs from DEX Screener. |
+| `POST /api/candidates/quote-check` | Checks up to three saved live cards for a roughly $5 Jupiter sell route; never sends a transaction. |
 | `GET /api/candidates?status=watch` | Filters the feed to one label. |
 | `GET /api/candidates/<mint>` | Returns one candidate and its saved snapshots. |
 | `GET /api/cohorts` | Existing public early-buyer co-buy research report. |
@@ -78,8 +94,8 @@ are discovery filters, not quality or safety proof.
 
 ## Next build step
 
-Add Jupiter sell quotes to the live shortlist. Then we will enrich only the
-remaining cards with token-risk checks and public wallet evidence.
+Add Solana Tracker token-risk checks, then public Helius wallet evidence, to the
+small group that survives the sell-route check.
 
 ## Safety rules
 
