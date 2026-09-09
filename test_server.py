@@ -72,6 +72,23 @@ class CandidateFeedTests(unittest.TestCase):
         self.assertEqual(result["summary"]["headline"], "Research candidate found: Full Scan ($FULL)")
         self.assertEqual(result["summary"]["top_candidate"]["mint"], "FullScanMint")
 
+    def test_full_scan_does_not_report_sample_cards_as_live_results(self):
+        stages = {
+            "discovery": {"records_saved": 0},
+            "sell_routes": {"sellable": 0, "note": "no cards"},
+            "safety": {"clean": 0, "note": "no cards"},
+            "wallet_evidence": {"clear": 0, "note": "no cards"},
+            "market_crosscheck": {"consistent": 0, "note": "no cards"},
+        }
+        sample_feed = {
+            "summary": {"candidate": 2, "watch": 1, "avoid": 2},
+            "candidates": [{"mint": "sample", "name": "Cinder", "symbol": "CINDER", "score": 99, "status": "candidate"}],
+        }
+
+        result = server.build_full_scan_summary(stages, sample_feed)
+
+        self.assertEqual(result["summary" if "summary" in result else "headline"], "No fresh trending cards this scan")
+
     def test_dexscreener_refresh_saves_a_qualified_live_watch_card(self):
         now = 1_800_000_000
         mint = "LiveDexMint111111111111111111111111111111111"
@@ -130,6 +147,13 @@ class CandidateFeedTests(unittest.TestCase):
             coingecko_fetcher=lambda page: {"data": [gecko_record] if page == 1 else [],
                                              "included": [{"id": "solana_" + gecko_mint,
                                                            "attributes": {"address": gecko_mint, "name": "Gecko Discovery", "symbol": "GECK"}}]},
+            dex_pair_fetcher=lambda url: [{
+                "chainId": "solana", "pairAddress": "TrackerDexPair",
+                "baseToken": {"address": tracker_mint, "name": "Tracker Discovery", "symbol": "TRACK"},
+                "priceUsd": "0.02", "marketCap": 220_000, "liquidity": {"usd": 61_000},
+                "volume": {"m5": 12_000}, "txns": {"m5": {"buys": 44, "sells": 20}},
+                "priceChange": {"m5": 8.2}, "pairCreatedAt": (now - 900) * 1000,
+            }],
             now=now,
         )
         feed = server.candidate_feed()
@@ -138,6 +162,15 @@ class CandidateFeedTests(unittest.TestCase):
         self.assertEqual(result["providers"]["coingecko"]["records_saved"], 1)
         self.assertEqual(result["records_saved"], 2)
         self.assertEqual({card["symbol"] for card in feed["candidates"]}, {"TRACK", "GECK"})
+
+    def test_old_or_flat_live_tokens_do_not_pass_fresh_trending_discovery(self):
+        old = dict(server.SAMPLE_CANDIDATES[0])
+        old.update({"source": "dexscreener", "age_minutes": 83_117})
+        flat = dict(server.SAMPLE_CANDIDATES[0])
+        flat.update({"source": "dexscreener", "price_change_5m_pct": 0})
+
+        self.assertFalse(server.passes_dex_discovery_filter(old))
+        self.assertFalse(server.passes_dex_discovery_filter(flat))
 
     def test_dexscreener_filter_rejects_thin_pair(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
