@@ -46,6 +46,32 @@ class CandidateFeedTests(unittest.TestCase):
         self.assertEqual(assessment["status"], "watch")
         self.assertTrue(any(gate["status"] == "PENDING" for gate in assessment["gates"]))
 
+    def test_full_scan_runs_each_research_gate_and_returns_a_final_summary(self):
+        calls = []
+
+        def stage(name, result):
+            def run():
+                calls.append(name)
+                return result
+            return run
+
+        feed = {
+            "summary": {"candidate": 1, "watch": 0, "avoid": 0},
+            "candidates": [{"mint": "FullScanMint", "name": "Full Scan", "symbol": "FULL", "score": 84, "status": "candidate"}],
+        }
+        result = server.run_full_research_scan(
+            discovery=stage("discovery", {"records_saved": 1}),
+            quote_check=stage("quotes", {"sellable": 1, "note": "route found"}),
+            safety_check=stage("safety", {"clean": 1, "note": "risk check passed"}),
+            wallet_check=stage("wallet", {"clear": 1, "note": "public evidence checked"}),
+            market_crosscheck=stage("crosscheck", {"consistent": 1, "note": "pool matches"}),
+            feed_provider=lambda: feed,
+        )
+
+        self.assertEqual(calls, ["discovery", "quotes", "safety", "wallet", "crosscheck"])
+        self.assertEqual(result["summary"]["headline"], "Research candidate found: Full Scan ($FULL)")
+        self.assertEqual(result["summary"]["top_candidate"]["mint"], "FullScanMint")
+
     def test_dexscreener_refresh_saves_a_qualified_live_watch_card(self):
         now = 1_800_000_000
         mint = "LiveDexMint111111111111111111111111111111111"
