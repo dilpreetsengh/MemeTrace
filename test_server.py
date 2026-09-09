@@ -27,6 +27,15 @@ class CandidateFeedTests(unittest.TestCase):
         self.assertEqual(statuses["PIGEON"], "watch")
         self.assertEqual(statuses["GLIM"], "avoid")
 
+    def test_empty_live_scan_does_not_restore_fictional_sample_cards(self):
+        server.mark_live_candidates_stale()
+
+        feed = server.candidate_feed()
+
+        self.assertFalse(feed["is_sample_data"])
+        self.assertEqual(feed["summary"]["total"], 0)
+        self.assertIn("No fresh Solana pairs", feed["note"])
+
     def test_thin_liquidity_and_bad_sellability_force_avoid(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
         candidate.update({"liquidity_usd": 9_000, "sell_impact_pct": 7.5})
