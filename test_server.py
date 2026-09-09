@@ -101,6 +101,44 @@ class CandidateFeedTests(unittest.TestCase):
         self.assertEqual(feed["candidates"][0]["symbol"], "LIVE")
         self.assertEqual(feed["candidates"][0]["status"], "watch")
 
+    def test_multi_source_refresh_adds_tracker_and_coingecko_candidates(self):
+        now = 1_800_000_000
+        tracker_mint = "TrackerDiscoveryMint1111111111111111111111111111"
+        gecko_mint = "CoinGeckoDiscoveryMint111111111111111111111111111"
+        created_at = server.datetime.fromtimestamp(now - 900, server.timezone.utc).isoformat()
+
+        tracker_record = {
+            "token": {"mint": tracker_mint, "name": "Tracker Discovery", "symbol": "TRACK"},
+            "pools": [{"poolId": "TrackerPool", "price": {"usd": 0.02}, "marketCap": {"usd": 220_000},
+                       "liquidity": {"usd": 61_000}, "createdAt": (now - 900) * 1000,
+                       "txns": {"buys": 44, "sells": 20, "volume": 12_000}}],
+            "events": {"5m": {"priceChangePercentage": 8.2, "volume": 12_000}},
+        }
+        gecko_record = {
+            "id": "solana_GeckoPool",
+            "attributes": {"address": "GeckoPool", "base_token_price_usd": "0.02", "market_cap_usd": "180000",
+                           "reserve_in_usd": "55_000", "volume_usd": {"m5": "10_000"},
+                           "transactions": {"m5": {"buys": 32, "sells": 16}},
+                           "pool_created_at": created_at, "price_change_percentage": {"m5": "6.5"}},
+            "relationships": {"network": {"data": {"id": "solana"}},
+                              "base_token": {"data": {"id": "solana_" + gecko_mint}}},
+        }
+
+        result = server.refresh_multi_source_candidates(
+            dex_refresh=lambda now: {"records_saved": 0},
+            tracker_fetcher=lambda path: [tracker_record],
+            coingecko_fetcher=lambda page: {"data": [gecko_record] if page == 1 else [],
+                                             "included": [{"id": "solana_" + gecko_mint,
+                                                           "attributes": {"address": gecko_mint, "name": "Gecko Discovery", "symbol": "GECK"}}]},
+            now=now,
+        )
+        feed = server.candidate_feed()
+
+        self.assertEqual(result["providers"]["solana_tracker"]["records_saved"], 1)
+        self.assertEqual(result["providers"]["coingecko"]["records_saved"], 1)
+        self.assertEqual(result["records_saved"], 2)
+        self.assertEqual({card["symbol"] for card in feed["candidates"]}, {"TRACK", "GECK"})
+
     def test_dexscreener_filter_rejects_thin_pair(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
         candidate.update({"liquidity_usd": 24_999, "age_minutes": 10, "volume_5m_usd": 2_000})
@@ -171,6 +209,22 @@ class CandidateFeedTests(unittest.TestCase):
 
         self.assertEqual(quote["status"], "no_route")
         self.assertEqual(assessment["status"], "avoid")
+
+    def test_helius_decimals_fallback_retries_a_fresh_jupiter_sell_quote(self):
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"source": "dexscreener", "price_usd": 0.02})
+
+        def fake_fetcher(url):
+            if "/tokens/v2/search" in url:
+                return []
+            self.assertIn("amount=250000000", url)
+            return {"priceImpactPct": "0.8", "routePlan": [{"percent": 100}]}
+
+        quote = server.check_jupiter_sell_quote(candidate, fake_fetcher, decimal_fallback=lambda mint: 6)
+
+        self.assertEqual(quote["status"], "pass")
+        self.assertEqual(quote["impact_pct"], 0.8)
+        self.assertIn("Helius fallback", quote["note"])
 
     def test_solana_tracker_danger_flag_is_saved_as_avoid(self):
         now = 1_800_000_000
