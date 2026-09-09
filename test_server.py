@@ -98,6 +98,21 @@ class CandidateFeedTests(unittest.TestCase):
 
         self.assertEqual(result["summary" if "summary" in result else "headline"], "No fresh trending cards this scan")
 
+    def test_empty_full_scan_reports_actual_coverage_and_near_misses(self):
+        stages = {
+            "discovery": {"records_saved": 0, "coverage": {"pairs_seen": 17, "common_failures": [{"label": "liquidity", "count": 11}]}},
+            "sell_routes": {"sellable": 0, "note": "no cards"},
+            "safety": {"clean": 0, "note": "no cards"},
+            "wallet_evidence": {"clear": 0, "note": "no cards"},
+            "market_crosscheck": {"consistent": 0, "note": "no cards"},
+        }
+        feed = {"summary": {"candidate": 0, "watch": 0, "avoid": 0}, "candidates": []}
+
+        result = server.build_full_scan_summary(stages, feed)
+
+        self.assertIn("Checked 17", result["detail"])
+        self.assertIn("liquidity (11)", result["detail"])
+
     def test_dexscreener_refresh_saves_a_qualified_live_watch_card(self):
         now = 1_800_000_000
         mint = "LiveDexMint111111111111111111111111111111111"
@@ -121,6 +136,7 @@ class CandidateFeedTests(unittest.TestCase):
         feed = server.candidate_feed()
 
         self.assertEqual(result["records_saved"], 1)
+        self.assertEqual(result["diagnostics"]["pairs_seen"], 1)
         self.assertFalse(feed["is_sample_data"])
         self.assertEqual(feed["summary"]["live"], 1)
         self.assertEqual(len(feed["candidates"]), 1)
@@ -131,6 +147,7 @@ class CandidateFeedTests(unittest.TestCase):
         now = 1_800_000_000
         tracker_mint = "TrackerDiscoveryMint1111111111111111111111111111"
         gecko_mint = "CoinGeckoDiscoveryMint111111111111111111111111111"
+        trending_mint = "TrendingDiscoveryMint11111111111111111111111111"
         created_at = server.datetime.fromtimestamp(now - 900, server.timezone.utc).isoformat()
 
         tracker_record = {
@@ -149,6 +166,15 @@ class CandidateFeedTests(unittest.TestCase):
             "relationships": {"network": {"data": {"id": "solana"}},
                               "base_token": {"data": {"id": "solana_" + gecko_mint}}},
         }
+        trending_record = {
+            "id": "solana_TrendingPool",
+            "attributes": {"address": "TrendingPool", "base_token_price_usd": "0.03", "market_cap_usd": "240000",
+                           "reserve_in_usd": "70_000", "volume_usd": {"m5": "14_000"},
+                           "transactions": {"m5": {"buys": 40, "sells": 18}},
+                           "pool_created_at": created_at, "price_change_percentage": {"m5": "7.5"}},
+            "relationships": {"network": {"data": {"id": "solana"}},
+                              "base_token": {"data": {"id": "solana_" + trending_mint}}},
+        }
 
         result = server.refresh_multi_source_candidates(
             dex_refresh=lambda now: {"records_saved": 0},
@@ -156,6 +182,9 @@ class CandidateFeedTests(unittest.TestCase):
             coingecko_fetcher=lambda page: {"data": [gecko_record] if page == 1 else [],
                                              "included": [{"id": "solana_" + gecko_mint,
                                                            "attributes": {"address": gecko_mint, "name": "Gecko Discovery", "symbol": "GECK"}}]},
+            coingecko_trending_fetcher=lambda: {"data": [trending_record],
+                                                 "included": [{"id": "solana_" + trending_mint,
+                                                               "attributes": {"address": trending_mint, "name": "Trending Discovery", "symbol": "TREND"}}]},
             dex_pair_fetcher=lambda url: [{
                 "chainId": "solana", "pairAddress": "TrackerDexPair",
                 "baseToken": {"address": tracker_mint, "name": "Tracker Discovery", "symbol": "TRACK"},
@@ -168,9 +197,10 @@ class CandidateFeedTests(unittest.TestCase):
         feed = server.candidate_feed()
 
         self.assertEqual(result["providers"]["solana_tracker"]["records_saved"], 1)
-        self.assertEqual(result["providers"]["coingecko"]["records_saved"], 1)
-        self.assertEqual(result["records_saved"], 2)
-        self.assertEqual({card["symbol"] for card in feed["candidates"]}, {"TRACK", "GECK"})
+        self.assertEqual(result["providers"]["coingecko"]["records_saved"], 2)
+        self.assertEqual(result["providers"]["coingecko"]["trending_pools_seen"], 1)
+        self.assertEqual(result["records_saved"], 3)
+        self.assertEqual({card["symbol"] for card in feed["candidates"]}, {"TRACK", "GECK", "TREND"})
 
     def test_old_or_flat_live_tokens_do_not_pass_fresh_trending_discovery(self):
         old = dict(server.SAMPLE_CANDIDATES[0])
