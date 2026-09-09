@@ -23,6 +23,9 @@ DEX Screener, Solana Tracker's latest/trending/graduated feeds, and CoinGecko's
 new-pools feed. The existing Solana Tracker and CoinGecko keys enable the latter
 two sources; no additional account is required.
 
+After the first live scan, MemeTrace never replaces an empty result with sample
+coins: no card means no fresh Solana pair currently passed the live-motion rules.
+
 With all four optional keys configured, **Run full research scan** performs that
 discovery pass and every bounded research gate in sequence, then gives one
 plain-English final summary. It remains research-only: it never connects a
