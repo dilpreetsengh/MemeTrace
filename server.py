@@ -1058,6 +1058,85 @@ def enrich_coingecko_crosscheck(fetcher=fetch_coingecko_pool, now: int | None = 
     return summary
 
 
+def build_full_scan_summary(stages: dict[str, dict[str, Any]], feed: dict[str, Any]) -> dict[str, Any]:
+    """Explain a completed research scan without turning it into trade advice."""
+    discovery = stages["discovery"]
+    quotes = stages["sell_routes"]
+    safety = stages["safety"]
+    wallets = stages["wallet_evidence"]
+    crosscheck = stages["market_crosscheck"]
+    summary = feed["summary"]
+
+    for stage in (quotes, safety, wallets, crosscheck):
+        note = str(stage.get("note") or "")
+        if "Add a free" in note and "API_KEY" in note:
+            return {
+                "headline": "Full scan needs one API key",
+                "detail": note,
+                "candidate_count": summary["candidate"],
+                "watch_count": summary["watch"],
+                "avoid_count": summary["avoid"],
+                "top_candidate": None,
+            }
+
+    finalists = [card for card in feed["candidates"] if card["status"] == "candidate"]
+    if finalists:
+        top = finalists[0]
+        return {
+            "headline": f"Research candidate found: {top['name']} (${top['symbol']})",
+            "detail": (
+                f"It passed the configured route, safety, public wallet-evidence, and market-data gates "
+                f"with a research score of {top['score']}/100. Review the card manually; this is not a buy instruction."
+            ),
+            "candidate_count": summary["candidate"],
+            "watch_count": summary["watch"],
+            "avoid_count": summary["avoid"],
+            "top_candidate": {"mint": top["mint"], "name": top["name"], "symbol": top["symbol"], "score": top["score"]},
+        }
+
+    if not discovery.get("records_saved"):
+        detail = "No new Solana pairs passed the starter market-cap, liquidity, age, volume, and activity filters."
+    elif not quotes.get("sellable"):
+        detail = "No scanned card had a usable small Jupiter sell route, so later checks were skipped to protect API limits."
+    elif not safety.get("clean"):
+        detail = "Sellable cards were found, but none passed the configured Solana Tracker safety gate."
+    elif not wallets.get("clear"):
+        detail = "Cards passed the first safety screen, but none cleared the public creator/authority evidence gate."
+    elif not crosscheck.get("consistent"):
+        detail = "Cards reached the final step, but no pool had a consistent second market-data snapshot yet."
+    else:
+        detail = "The scan completed, but no card cleared every configured research gate. Review Watch and Avoid cards before scanning again."
+
+    return {
+        "headline": "No completed research candidate this scan",
+        "detail": detail,
+        "candidate_count": summary["candidate"],
+        "watch_count": summary["watch"],
+        "avoid_count": summary["avoid"],
+        "top_candidate": None,
+    }
+
+
+def run_full_research_scan(
+    discovery=refresh_dexscreener_candidates,
+    quote_check=enrich_jupiter_sellability,
+    safety_check=enrich_solana_tracker_risk,
+    wallet_check=enrich_helius_wallet_evidence,
+    market_crosscheck=enrich_coingecko_crosscheck,
+    feed_provider=candidate_feed,
+) -> dict[str, Any]:
+    """Run every bounded, research-only stage once and return one plain-English result."""
+    stages = {
+        "discovery": discovery(),
+        "sell_routes": quote_check(),
+        "safety": safety_check(),
+        "wallet_evidence": wallet_check(),
+        "market_crosscheck": market_crosscheck(),
+    }
+    feed = feed_provider()
+    return {"stages": stages, "summary": build_full_scan_summary(stages, feed)}
+
+
 def ingest_wallet(address: str) -> dict:
     """Ingest token transfers for a single wallet. A transfer is not automatically a trade."""
     txs = fetch_helius_wallet_transactions(address)
@@ -1195,6 +1274,8 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if path == "/api/candidates/refresh":
                 return self.json_response(200, refresh_dexscreener_candidates())
+            if path == "/api/candidates/full-scan":
+                return self.json_response(200, run_full_research_scan())
             if path == "/api/candidates/quote-check":
                 return self.json_response(200, enrich_jupiter_sellability())
             if path == "/api/candidates/safety-check":
@@ -1213,5 +1294,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     database().close()
     print("MemeTrace running at http://127.0.0.1:8080")
-    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
+    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  POST /api/candidates/full-scan  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
