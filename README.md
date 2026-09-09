@@ -51,6 +51,41 @@ needed to calculate a roughly $5 token sell in atomic units.
 Do not paste the key into ChatGPT or commit `.env` to GitHub. The check uses at
 most three saved live cards per click to respect the free API rate limit.
 
+### Optional: enable token safety checks
+
+The **Check token safety** button sends only cards that already have a Jupiter
+sell route to Solana Tracker. It records the provider's point-in-time risk score
+and flags such as freeze/mint authority, liquidity danger, bundlers, insiders,
+and developer holdings. It does not identify real people and does not send a
+transaction.
+
+Add a free Solana Tracker key after `SOLANA_TRACKER_API_KEY=` in the same `.env`
+file, then restart the server. Tokens with any provider `danger` flag, a rugged
+status, or a risk score of 7+ are marked `Avoid`; clean cards still wait for the
+Helius wallet-evidence check.
+
+### Optional: enable public wallet evidence
+
+The **Check wallet evidence** button sends only route-confirmed, Tracker-clean
+cards to Helius. It reads public asset authority/creator metadata and a bounded
+recent transaction history for the observed address. Active mint/freeze authority
+is a hard flag. Token transfers from an observed creator/authority address are
+shown as unclassified evidence, not proof of selling, identity, coordination, or
+intent.
+
+Add a free Helius key after `HELIUS_API_KEY=` in `.env`, then restart the server.
+
+### Optional: cross-check pool data
+
+The **Cross-check market data** button sends only cards that passed the sell,
+token-safety, and wallet-evidence gates to CoinGecko's on-chain Demo API. It
+compares the DEX Screener price/liquidity snapshot with CoinGecko's pool data.
+More than 10% price difference or 40% liquidity difference keeps the card at
+`Watch`, rather than declaring either source “wrong.”
+
+Add a free CoinGecko Demo key after `COINGECKO_DEMO_API_KEY=` in `.env`, then
+restart the server. A live `Candidate` requires this final cross-check too.
+
 ## Test it
 
 ```bash
@@ -65,6 +100,9 @@ python3 -m unittest -v
 | `GET /api/candidates` | Returns the ranked candidate feed. |
 | `POST /api/candidates/refresh` | Pulls a small set of public Solana token profiles and qualifying pairs from DEX Screener. |
 | `POST /api/candidates/quote-check` | Checks up to three saved live cards for a roughly $5 Jupiter sell route; never sends a transaction. |
+| `POST /api/candidates/safety-check` | Sends route-confirmed cards to Solana Tracker and records point-in-time token-risk evidence. |
+| `POST /api/candidates/wallet-check` | Sends Tracker-clean cards to Helius for bounded public authority and transfer evidence. |
+| `POST /api/candidates/crosscheck` | Compares final-card pool data with CoinGecko's on-chain Demo API. |
 | `GET /api/candidates?status=watch` | Filters the feed to one label. |
 | `GET /api/candidates/<mint>` | Returns one candidate and its saved snapshots. |
 | `GET /api/cohorts` | Existing public early-buyer co-buy research report. |
@@ -94,8 +132,8 @@ are discovery filters, not quality or safety proof.
 
 ## Next build step
 
-Add Solana Tracker token-risk checks, then public Helius wallet evidence, to the
-small group that survives the sell-route check.
+Create the three free API keys locally, then run the full research pipeline from
+the dashboard. Twitter/X and automated bubble-map data remain later modules.
 
 ## Safety rules
 
