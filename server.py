@@ -18,8 +18,25 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).parent
+
+
+def load_local_env() -> None:
+    """Load simple KEY=value pairs from a local .env file without another package."""
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+load_local_env()
 DB_PATH = ROOT / "memetrace.db"
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 
 STATUS_ORDER = {"candidate": 0, "watch": 1, "avoid": 2}
 VALID_STATUSES = set(STATUS_ORDER)
@@ -30,6 +47,10 @@ DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
 DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
 DEX_DISCOVERY_MIN_AGE_MINUTES = 5
 DEX_DISCOVERY_MIN_5M_VOLUME_USD = 1_000
+JUPITER_API_BASE = "https://api.jup.ag"
+JUPITER_TEST_SELL_USD = 5
+JUPITER_MAX_QUOTES_PER_CHECK = 3
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Fictional fixtures let us review the first candidate feed before any live
 # market, quote, safety, or wallet provider is connected.
@@ -108,6 +129,7 @@ def database() -> sqlite3.Connection:
       pair_address TEXT,
       source TEXT NOT NULL,
       setup TEXT NOT NULL,
+      price_usd REAL NOT NULL DEFAULT 0,
       market_cap_usd REAL NOT NULL,
       liquidity_usd REAL NOT NULL,
       volume_5m_usd REAL NOT NULL,
@@ -117,6 +139,9 @@ def database() -> sqlite3.Connection:
       price_change_5m_pct REAL NOT NULL,
       previous_high_market_cap_usd REAL,
       sell_impact_pct REAL,
+      sell_quote_status TEXT NOT NULL DEFAULT 'pending',
+      sell_quote_note TEXT,
+      sell_quote_checked_at INTEGER,
       risk_flags_json TEXT NOT NULL DEFAULT '[]',
       safety_status TEXT NOT NULL DEFAULT 'pending',
       observed_at INTEGER NOT NULL,
@@ -136,8 +161,23 @@ def database() -> sqlite3.Connection:
     CREATE INDEX IF NOT EXISTS candidate_snapshots_mint_idx
       ON candidate_snapshots(mint, captured_at DESC);
     """)
+    migrate_candidate_columns(conn)
     seed_sample_candidates(conn)
     return conn
+
+
+def migrate_candidate_columns(conn: sqlite3.Connection) -> None:
+    """Additive migrations keep existing local research databases usable."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()}
+    additions = {
+        "price_usd": "REAL NOT NULL DEFAULT 0",
+        "sell_quote_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "sell_quote_note": "TEXT",
+        "sell_quote_checked_at": "INTEGER",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE candidates ADD COLUMN {name} {definition}")
 
 
 def seed_sample_candidates(conn: sqlite3.Connection) -> None:
@@ -196,6 +236,10 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
     risk_flags = candidate.get("risk_flags") or []
     source = candidate.get("source", "unknown")
     safety_status = candidate.get("safety_status", "pending")
+    sell_quote_status = "pass" if source == "sample" and sell_impact is not None else (
+        candidate.get("sell_quote_status") or ("pass" if sell_impact is not None else "pending")
+    )
+    sell_quote_note = candidate.get("sell_quote_note") or ""
 
     liquidity_ratio = liquidity / market_cap if market_cap else 0
     volume_to_liquidity = volume_5m / liquidity if liquidity else 0
@@ -266,19 +310,25 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         score -= 8
         warnings.append("Recent sell count exceeds buy count.")
 
-    if sell_impact is None:
+    if sell_quote_status == "no_route":
+        hard_failures.append("Jupiter found no route to sell the small test amount")
+        gates.append({"label": "Small sell quote", "status": "FAIL", "detail": sell_quote_note or "No sell route was returned for the small test amount."})
+    elif sell_quote_status in {"unavailable", "not_configured"}:
+        gates.append({"label": "Small sell quote", "status": "PENDING", "detail": sell_quote_note or "Jupiter quote check needs to be retried."})
+        warnings.append("A real small-order sell quote is still required before this could be tradeable.")
+    elif sell_impact is None:
         gates.append({"label": "Small sell quote", "status": "PENDING", "detail": "Jupiter quote check is not connected yet."})
         warnings.append("A real small-order sell quote is still required before this could be tradeable.")
     elif sell_impact <= 2:
         score += 15
-        gates.append({"label": "Small sell quote", "status": "PASS", "detail": f"Fixture estimates {sell_impact:.1f}% sell impact."})
+        gates.append({"label": "Small sell quote", "status": "PASS", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
     elif sell_impact <= 3:
         score += 6
-        gates.append({"label": "Small sell quote", "status": "WATCH", "detail": f"Fixture estimates {sell_impact:.1f}% sell impact."})
+        gates.append({"label": "Small sell quote", "status": "WATCH", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
     else:
         score -= 25
         hard_failures.append("estimated sell impact is above 3%")
-        gates.append({"label": "Small sell quote", "status": "FAIL", "detail": f"Fixture estimates {sell_impact:.1f}% sell impact."})
+        gates.append({"label": "Small sell quote", "status": "FAIL", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
 
     if candidate.get("setup") == "panic_reclaim":
         if previous_high >= 300_000 and 35 <= drawdown_pct <= 70 and price_change >= 3:
@@ -434,6 +484,7 @@ def normalize_dexscreener_pair(pair: dict[str, Any], now: int | None = None) -> 
         "pair_address": pair.get("pairAddress"),
         "source": "dexscreener",
         "setup": "early_momentum",
+        "price_usd": number(pair.get("priceUsd")),
         "market_cap_usd": number(pair.get("marketCap") or pair.get("fdv")),
         "liquidity_usd": number((pair.get("liquidity") or {}).get("usd")),
         "volume_5m_usd": number((pair.get("volume") or {}).get("m5")),
@@ -465,7 +516,7 @@ def upsert_candidate(candidate: dict[str, Any], conn: sqlite3.Connection) -> Non
     """Store the current observation and append a small historical snapshot."""
     values = (
         candidate["mint"], candidate["name"], candidate["symbol"], candidate["chain"],
-        candidate["pair_address"], candidate["source"], candidate["setup"],
+        candidate["pair_address"], candidate["source"], candidate["setup"], candidate["price_usd"],
         candidate["market_cap_usd"], candidate["liquidity_usd"], candidate["volume_5m_usd"],
         candidate["buys_5m"], candidate["sells_5m"], candidate["age_minutes"],
         candidate["price_change_5m_pct"], candidate["previous_high_market_cap_usd"],
@@ -474,20 +525,20 @@ def upsert_candidate(candidate: dict[str, Any], conn: sqlite3.Connection) -> Non
     )
     conn.execute(
         """INSERT INTO candidates(
-          mint, name, symbol, chain, pair_address, source, setup, market_cap_usd,
+          mint, name, symbol, chain, pair_address, source, setup, price_usd, market_cap_usd,
           liquidity_usd, volume_5m_usd, buys_5m, sells_5m, age_minutes,
           price_change_5m_pct, previous_high_market_cap_usd, sell_impact_pct,
           risk_flags_json, safety_status, observed_at, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(mint) DO UPDATE SET
           name=excluded.name, symbol=excluded.symbol, chain=excluded.chain,
           pair_address=excluded.pair_address, source=excluded.source, setup=excluded.setup,
-          market_cap_usd=excluded.market_cap_usd, liquidity_usd=excluded.liquidity_usd,
+          price_usd=excluded.price_usd, market_cap_usd=excluded.market_cap_usd, liquidity_usd=excluded.liquidity_usd,
           volume_5m_usd=excluded.volume_5m_usd, buys_5m=excluded.buys_5m,
           sells_5m=excluded.sells_5m, age_minutes=excluded.age_minutes,
           price_change_5m_pct=excluded.price_change_5m_pct,
           previous_high_market_cap_usd=excluded.previous_high_market_cap_usd,
-          sell_impact_pct=excluded.sell_impact_pct, risk_flags_json=excluded.risk_flags_json,
+          risk_flags_json=excluded.risk_flags_json,
           safety_status=excluded.safety_status, observed_at=excluded.observed_at""",
         values,
     )
@@ -546,6 +597,116 @@ def refresh_dexscreener_candidates(fetcher=fetch_dexscreener_json, now: int | No
         "skipped": skipped,
         "note": "Public DEX Screener pair data only. Saved records remain Watch until sell quotes and safety checks are connected.",
     }
+
+
+class JupiterNoRouteError(UpstreamDataError):
+    """Jupiter did not return a route for a bounded research-only sell quote."""
+
+
+_last_jupiter_request_at = 0.0
+
+
+def fetch_jupiter_json(url: str) -> Any:
+    """Read Jupiter token metadata or a quote. It never builds or sends a transaction."""
+    if not JUPITER_API_KEY:
+        raise ValueError("JUPITER_API_KEY is not set. Add a free Jupiter developer key to .env, then restart the server.")
+    global _last_jupiter_request_at
+    wait_seconds = 1.05 - (time.monotonic() - _last_jupiter_request_at)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MemeTrace/0.1 research dashboard", "x-api-key": JUPITER_API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            _last_jupiter_request_at = time.monotonic()
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        _last_jupiter_request_at = time.monotonic()
+        if "/swap/v1/quote" in url and exc.code in {400, 404}:
+            raise JupiterNoRouteError("Jupiter returned no sell route for this small test amount.") from exc
+        raise UpstreamDataError(f"Jupiter returned HTTP {exc.code}. Try the quote check again later.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach Jupiter. Try the quote check again later.") from exc
+
+
+def jupiter_token_metadata(mint: str, fetcher=fetch_jupiter_json) -> dict[str, Any] | None:
+    response = fetcher(f"{JUPITER_API_BASE}/tokens/v2/search?{urllib.parse.urlencode({'query': mint})}")
+    records = response.get("data", response) if isinstance(response, dict) else response
+    if not isinstance(records, list):
+        return None
+    return next((record for record in records if record.get("address") == mint), None)
+
+
+def check_jupiter_sell_quote(candidate: dict[str, Any], fetcher=fetch_jupiter_json) -> dict[str, Any]:
+    """Ask Jupiter whether a roughly $5 token sell has a route; no wallet is used."""
+    price_usd = number(candidate.get("price_usd"))
+    if price_usd <= 0:
+        return {"status": "unavailable", "note": "DEX Screener did not provide a usable USD price for this pair.", "impact_pct": None}
+    try:
+        metadata = jupiter_token_metadata(candidate["mint"], fetcher)
+        if not metadata or metadata.get("decimals") is None:
+            return {"status": "unavailable", "note": "Jupiter did not return token decimals for this mint.", "impact_pct": None}
+        raw_amount = max(1, round((JUPITER_TEST_SELL_USD / price_usd) * (10 ** int(metadata["decimals"]))))
+        query = urllib.parse.urlencode({
+            "inputMint": candidate["mint"],
+            "outputMint": SOL_MINT,
+            "amount": raw_amount,
+            "slippageBps": 100,
+            "restrictIntermediateTokens": "true",
+        })
+        quote = fetcher(f"{JUPITER_API_BASE}/swap/v1/quote?{query}")
+        if not isinstance(quote, dict) or not quote.get("routePlan"):
+            return {"status": "no_route", "note": "Jupiter returned no sell route for this small test amount.", "impact_pct": None}
+        impact_pct = number(quote.get("priceImpactPct"))
+        return {
+            "status": "pass",
+            "note": f"Jupiter returned a route for a roughly ${JUPITER_TEST_SELL_USD} test sell.",
+            "impact_pct": impact_pct,
+        }
+    except JupiterNoRouteError as exc:
+        return {"status": "no_route", "note": str(exc), "impact_pct": None}
+    except (UpstreamDataError, ValueError) as exc:
+        return {"status": "unavailable", "note": str(exc), "impact_pct": None}
+
+
+def enrich_jupiter_sellability(fetcher=fetch_jupiter_json, now: int | None = None) -> dict[str, Any]:
+    """Quote only a few saved live cards to respect Jupiter's free-tier rate limit."""
+    if not JUPITER_API_KEY and fetcher is fetch_jupiter_json:
+        return {
+            "checked": 0,
+            "sellable": 0,
+            "no_route": 0,
+            "unavailable": 0,
+            "note": "Add a free JUPITER_API_KEY to .env, restart the server, then try again.",
+        }
+    now = now or int(time.time())
+    conn = database()
+    rows = conn.execute(
+        """SELECT * FROM candidates WHERE source != 'sample'
+           ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
+        (JUPITER_MAX_QUOTES_PER_CHECK,),
+    ).fetchall()
+    summary = {"checked": 0, "sellable": 0, "no_route": 0, "unavailable": 0}
+    for row in rows:
+        result = check_jupiter_sell_quote(dict(row), fetcher)
+        conn.execute(
+            """UPDATE candidates SET sell_impact_pct=?, sell_quote_status=?, sell_quote_note=?,
+               sell_quote_checked_at=? WHERE mint=?""",
+            (result["impact_pct"], result["status"], result["note"], now, row["mint"]),
+        )
+        summary["checked"] += 1
+        if result["status"] == "pass":
+            summary["sellable"] += 1
+        else:
+            summary[result["status"]] += 1
+    conn.commit()
+    summary["note"] = (
+        "Quotes are research-only and do not send a transaction. Safety and wallet checks are still pending."
+        if summary["checked"] else "No live cards are available yet. Get live Solana pairs first."
+    )
+    return summary
 
 
 def fetch_helius_wallet_transactions(address: str) -> list[dict]:
@@ -699,6 +860,8 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if path == "/api/candidates/refresh":
                 return self.json_response(200, refresh_dexscreener_candidates())
+            if path == "/api/candidates/quote-check":
+                return self.json_response(200, enrich_jupiter_sellability())
         except UpstreamDataError as exc:
             return self.json_response(502, {"error": str(exc)})
         except Exception as exc:  # avoids leaking a stack trace in local browser output
@@ -709,5 +872,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     database().close()
     print("MemeTrace running at http://127.0.0.1:8080")
-    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  /api/cohorts")
+    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  POST /api/candidates/quote-check  /api/cohorts")
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
