@@ -42,7 +42,7 @@ JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 STATUS_ORDER = {"candidate": 0, "watch": 1, "avoid": 2}
 VALID_STATUSES = set(STATUS_ORDER)
 DEX_SCREENER_API_BASE = "https://api.dexscreener.com"
-DEX_DISCOVERY_MAX_TOKENS = 15
+DEX_DISCOVERY_MAX_TOKENS = 30
 DEX_DISCOVERY_MIN_MARKET_CAP_USD = 70_000
 DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
 DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
@@ -80,8 +80,9 @@ SOLANA_TRACKER_DISCOVERY_PATHS = (
     "tokens/trending/1h",
     "tokens/multi/graduated",
 )
-SOLANA_TRACKER_DISCOVERY_MAX_TOKENS = 24
+SOLANA_TRACKER_DISCOVERY_MAX_TOKENS = 30
 COINGECKO_DISCOVERY_PAGES = 2
+COINGECKO_TRENDING_DURATION = "1h"
 
 # Fictional fixtures let us review the first candidate feed before any live
 # market, quote, safety, or wallet provider is connected.
@@ -622,21 +623,61 @@ def normalize_dexscreener_pair(pair: dict[str, Any], now: int | None = None) -> 
     }
 
 
+def discovery_filter_failures(candidate: dict[str, Any]) -> list[str]:
+    """Explain exactly why a current pair did not enter the expensive risk pipeline."""
+    market_cap = number(candidate.get("market_cap_usd"))
+    liquidity = number(candidate.get("liquidity_usd"))
+    age_minutes = number(candidate.get("age_minutes"))
+    volume = number(candidate.get("volume_5m_usd"))
+    buys = int(candidate.get("buys_5m") or 0)
+    sells = int(candidate.get("sells_5m") or 0)
+    price_change = number(candidate.get("price_change_5m_pct"))
+    buy_sell_ratio = buys / sells if sells else float(buys) if buys else 0
+    failures: list[str] = []
+    if not DEX_DISCOVERY_MIN_MARKET_CAP_USD <= market_cap <= DEX_DISCOVERY_MAX_MARKET_CAP_USD:
+        failures.append("market cap")
+    if liquidity < DEX_DISCOVERY_MIN_LIQUIDITY_USD:
+        failures.append("liquidity")
+    if not DEX_DISCOVERY_MIN_AGE_MINUTES <= age_minutes <= DEX_DISCOVERY_MAX_AGE_MINUTES:
+        failures.append("age")
+    if volume < DEX_DISCOVERY_MIN_5M_VOLUME_USD:
+        failures.append("five-minute volume")
+    if buys + sells < DEX_DISCOVERY_MIN_5M_SWAPS:
+        failures.append("recent swap count")
+    if buy_sell_ratio < DEX_DISCOVERY_MIN_BUY_SELL_RATIO:
+        failures.append("buy pressure")
+    if price_change < DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT:
+        failures.append("five-minute momentum")
+    elif price_change > DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT:
+        failures.append("overextended five-minute spike")
+    return failures
+
+
+def discovery_diagnostics(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose bounded feed coverage and common rejection reasons instead of hiding an empty scan."""
+    failures: defaultdict[str, int] = defaultdict(int)
+    passed = 0
+    for candidate in candidates:
+        reasons = discovery_filter_failures(candidate)
+        if reasons:
+            for reason in reasons:
+                failures[reason] += 1
+        else:
+            passed += 1
+    return {
+        "pairs_seen": len(candidates),
+        "passed_starter_filter": passed,
+        "rejected": len(candidates) - passed,
+        "common_failures": [
+            {"label": label, "count": count}
+            for label, count in sorted(failures.items(), key=lambda item: (-item[1], item[0]))[:3]
+        ],
+    }
+
+
 def passes_dex_discovery_filter(candidate: dict[str, Any]) -> bool:
     """Keep only fresh Solana pairs with live upward movement before later API checks."""
-    market_cap = number(candidate["market_cap_usd"])
-    buys = int(candidate["buys_5m"])
-    sells = int(candidate["sells_5m"])
-    buy_sell_ratio = buys / sells if sells else float(buys) if buys else 0
-    return (
-        DEX_DISCOVERY_MIN_MARKET_CAP_USD <= market_cap <= DEX_DISCOVERY_MAX_MARKET_CAP_USD
-        and number(candidate["liquidity_usd"]) >= DEX_DISCOVERY_MIN_LIQUIDITY_USD
-        and DEX_DISCOVERY_MIN_AGE_MINUTES <= number(candidate["age_minutes"]) <= DEX_DISCOVERY_MAX_AGE_MINUTES
-        and number(candidate["volume_5m_usd"]) >= DEX_DISCOVERY_MIN_5M_VOLUME_USD
-        and buys + sells >= DEX_DISCOVERY_MIN_5M_SWAPS
-        and buy_sell_ratio >= DEX_DISCOVERY_MIN_BUY_SELL_RATIO
-        and DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT <= number(candidate["price_change_5m_pct"]) <= DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT
-    )
+    return not discovery_filter_failures(candidate)
 
 
 def upsert_candidate(candidate: dict[str, Any], conn: sqlite3.Connection) -> None:
@@ -701,6 +742,7 @@ def refresh_dexscreener_candidates(fetcher=fetch_dexscreener_json, now: int | No
     saved = 0
     pairs_read = 0
     skipped = 0
+    observed_candidates: list[dict[str, Any]] = []
     conn = database()
     for address in token_addresses:
         pairs = fetcher(f"{DEX_SCREENER_API_BASE}/token-pairs/v1/solana/{urllib.parse.quote(address)}")
@@ -709,6 +751,7 @@ def refresh_dexscreener_candidates(fetcher=fetch_dexscreener_json, now: int | No
             continue
         normalized = [normalize_dexscreener_pair(pair, now) for pair in pairs if isinstance(pair, dict)]
         normalized = [candidate for candidate in normalized if candidate is not None]
+        observed_candidates.extend(normalized)
         pairs_read += len(normalized)
         qualified = [candidate for candidate in normalized if passes_dex_discovery_filter(candidate)]
         if not qualified:
@@ -726,6 +769,7 @@ def refresh_dexscreener_candidates(fetcher=fetch_dexscreener_json, now: int | No
         "pairs_read": pairs_read,
         "records_saved": saved,
         "skipped": skipped,
+        "diagnostics": discovery_diagnostics(observed_candidates),
         "note": "Public DEX Screener pair data only. Saved records remain Watch until sell quotes and safety checks are connected.",
     }
 
@@ -763,6 +807,24 @@ def fetch_coingecko_new_pools(page: int) -> Any:
         raise UpstreamDataError(f"CoinGecko discovery returned HTTP {exc.code}.") from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise UpstreamDataError("Could not reach CoinGecko new-pools discovery. Try again in a moment.") from exc
+
+
+def fetch_coingecko_trending_pools() -> Any:
+    """Read current one-hour Solana pool momentum with the existing CoinGecko Demo key."""
+    if not COINGECKO_DEMO_API_KEY:
+        raise ValueError("COINGECKO_DEMO_API_KEY is not set.")
+    query = urllib.parse.urlencode({"include": "base_token", "duration": COINGECKO_TRENDING_DURATION})
+    request = urllib.request.Request(
+        f"{COINGECKO_API_BASE}/onchain/networks/solana/trending_pools?{query}",
+        headers={"User-Agent": "MemeTrace/0.1 research dashboard", "x-cg-demo-api-key": COINGECKO_DEMO_API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"CoinGecko trending-pools discovery returned HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach CoinGecko trending-pools discovery. Try again in a moment.") from exc
 
 
 def value_at(data: dict[str, Any], *keys: str) -> Any:
@@ -892,6 +954,7 @@ def refresh_multi_source_candidates(
     dex_refresh=refresh_dexscreener_candidates,
     tracker_fetcher=fetch_solana_tracker_discovery,
     coingecko_fetcher=fetch_coingecko_new_pools,
+    coingecko_trending_fetcher=fetch_coingecko_trending_pools,
     dex_pair_fetcher=fetch_dexscreener_json,
     now: int | None = None,
 ) -> dict[str, Any]:
@@ -902,7 +965,7 @@ def refresh_multi_source_candidates(
 
     try:
         dex = dex_refresh(now=now)
-        providers["dexscreener"] = {"records_saved": dex["records_saved"], "status": "ok"}
+        providers["dexscreener"] = {"records_saved": dex["records_saved"], "status": "ok", "diagnostics": dex.get("diagnostics", {})}
     except (UpstreamDataError, ValueError) as exc:
         providers["dexscreener"] = {"records_saved": 0, "status": "unavailable", "note": str(exc)}
 
@@ -944,6 +1007,7 @@ def refresh_multi_source_candidates(
         providers["solana_tracker"] = {"records_saved": 0, "status": "ok"}
     tracker_saved = save_discovery_candidates(tracker_candidates)
     providers["solana_tracker"]["records_saved"] = tracker_saved
+    providers["solana_tracker"]["diagnostics"] = discovery_diagnostics(tracker_candidates)
 
     coingecko_candidates: list[dict[str, Any]] = []
     for page in range(1, COINGECKO_DISCOVERY_PAGES + 1):
@@ -958,16 +1022,46 @@ def refresh_multi_source_candidates(
     else:
         providers["coingecko"] = {"records_saved": 0, "status": "ok"}
 
+    try:
+        response = coingecko_trending_fetcher()
+        included = {item.get("id"): item for item in response.get("included") or [] if isinstance(item, dict) and item.get("id")}
+        normalized = [normalize_coingecko_candidate(item, included, now) for item in response.get("data") or [] if isinstance(item, dict)]
+        coingecko_candidates.extend(item for item in normalized if item is not None)
+        providers["coingecko"]["trending_pools_seen"] = len(normalized)
+    except (UpstreamDataError, ValueError) as exc:
+        providers["coingecko"]["status"] = "partial"
+        providers["coingecko"]["note"] = str(exc)
+
     coingecko_saved = save_discovery_candidates(coingecko_candidates)
     providers["coingecko"]["records_saved"] = coingecko_saved
+    providers["coingecko"]["diagnostics"] = discovery_diagnostics(coingecko_candidates)
 
     total_saved = sum(number(provider.get("records_saved")) for provider in providers.values())
+    failure_counts: defaultdict[str, int] = defaultdict(int)
+    pairs_seen = 0
+    passed_starter_filter = 0
+    for provider in providers.values():
+        diagnostics = provider.get("diagnostics") or {}
+        pairs_seen += int(diagnostics.get("pairs_seen") or 0)
+        passed_starter_filter += int(diagnostics.get("passed_starter_filter") or 0)
+        for failure in diagnostics.get("common_failures") or []:
+            failure_counts[str(failure.get("label"))] += int(failure.get("count") or 0)
+    coverage = {
+        "pairs_seen": pairs_seen,
+        "passed_starter_filter": passed_starter_filter,
+        "rejected": max(0, pairs_seen - passed_starter_filter),
+        "common_failures": [
+            {"label": label, "count": count}
+            for label, count in sorted(failure_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+        ],
+    }
     return {
         "source": "multi_source",
         "refreshed_at": now,
         "records_saved": int(total_saved),
         "providers": providers,
-        "note": "Bounded DEX Screener, Solana Tracker, and CoinGecko discovery. Cards still must pass sellability and safety gates.",
+        "coverage": coverage,
+        "note": "Bounded DEX Screener, Solana Tracker, CoinGecko new-pool, and CoinGecko one-hour trending-pool discovery. Cards still must pass sellability and safety gates.",
     }
 
 
@@ -1503,9 +1597,22 @@ def build_full_scan_summary(stages: dict[str, dict[str, Any]], feed: dict[str, A
             }
 
     if not discovery.get("records_saved"):
+        coverage = discovery.get("coverage") or {}
+        pairs_seen = int(coverage.get("pairs_seen") or 0)
+        failures = coverage.get("common_failures") or []
+        failure_summary = ", ".join(
+            f"{item.get('label')} ({int(item.get('count') or 0)})" for item in failures
+        )
+        detail = (
+            f"Checked {pairs_seen} current pair snapshots across the bounded discovery feeds. None met every strict starter rule"
+            + (f". Most common near-miss gates: {failure_summary}." if failure_summary else ".")
+            + " This does not mean no moving coins exist; it means this scan did not find one inside the current research limits."
+            if pairs_seen else
+            "The discovery providers did not return usable current pair snapshots this scan. Check the provider notes and retry shortly; sample cards are never treated as live results."
+        )
         return {
             "headline": "No fresh trending cards this scan",
-            "detail": "No new pair passed the fresh age, real five-minute activity, liquidity, and momentum filters. Sample cards are not live results.",
+            "detail": detail,
             "candidate_count": 0,
             "watch_count": 0,
             "avoid_count": 0,
