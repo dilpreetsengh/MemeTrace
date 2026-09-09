@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,6 +84,111 @@ SOLANA_TRACKER_DISCOVERY_PATHS = (
 SOLANA_TRACKER_DISCOVERY_MAX_TOKENS = 30
 COINGECKO_DISCOVERY_PAGES = 2
 COINGECKO_TRENDING_DURATION = "1h"
+RESEARCH_FILTERS_PATH = ROOT / "research_filters.json"
+
+# These are deliberately visible and editable from the local dashboard.  They
+# are research preferences, not safety guarantees or trade instructions.
+DEFAULT_RESEARCH_FILTERS: dict[str, dict[str, Any]] = {
+    "market_cap": {"enabled": True, "min": 70_000, "max": 3_000_000},
+    "liquidity": {"enabled": True, "min": 25_000},
+    "age": {"enabled": True, "min": 10, "max": 48 * 60},
+    "volume_5m": {"enabled": True, "min": 2_000},
+    "swaps_5m": {"enabled": True, "min": 10},
+    "buy_sell_ratio": {"enabled": True, "min": 1.30},
+    "price_change_5m": {"enabled": True, "min": 3, "max": 25},
+    "candidate_market_cap": {"enabled": True, "min": 70_000, "max": 750_000},
+    "candidate_liquidity": {"enabled": True, "min": 50_000},
+    "liquidity_ratio": {"enabled": True, "min_pct": 15, "hard_min_pct": 10},
+    "volume_to_liquidity": {"enabled": True, "min": 0.10, "max": 2.0, "hard_max": 5.0},
+    "sell_impact": {"enabled": True, "max_pct": 2.0, "hard_max_pct": 3.0},
+    "tracker_risk_score": {"enabled": True, "max": 3.0, "hard_max": 6.0},
+    "top10_holders": {"enabled": True, "max_pct": 15.0},
+    "snipers": {"enabled": True, "max_pct": 10.0, "hard_max_pct": 20.0},
+    "insiders": {"enabled": True, "max_pct": 5.0, "hard_max_pct": 10.0},
+    "bundlers": {"enabled": True, "max_pct": 5.0, "hard_max_pct": 15.0},
+    "developer_holdings": {"enabled": True, "max_pct": 1.0, "hard_max_pct": 5.0},
+    "require_sell_route": {"enabled": True},
+    "require_market_crosscheck": {"enabled": True},
+    "active_authority": {"enabled": True},
+    "creator_activity": {"enabled": True},
+}
+
+
+def filter_settings() -> dict[str, dict[str, Any]]:
+    """Return a copy so callers cannot accidentally alter the active local policy."""
+    return deepcopy(ACTIVE_RESEARCH_FILTERS)
+
+
+def normalize_research_filters(raw: Any) -> dict[str, dict[str, Any]]:
+    """Accept only documented local research controls and validate their ranges."""
+    if not isinstance(raw, dict):
+        raise ValueError("Research filters must be a JSON object.")
+    normalized = deepcopy(DEFAULT_RESEARCH_FILTERS)
+    for group, defaults in DEFAULT_RESEARCH_FILTERS.items():
+        supplied = raw.get(group, {})
+        if not isinstance(supplied, dict):
+            continue
+        for key, default in defaults.items():
+            value = supplied.get(key, default)
+            if key == "enabled":
+                if not isinstance(value, bool):
+                    raise ValueError(f"{group}.enabled must be true or false.")
+                normalized[group][key] = value
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{group}.{key} must be a number.")
+            if value < 0 or value > 1_000_000_000:
+                raise ValueError(f"{group}.{key} is outside the allowed research range.")
+            normalized[group][key] = float(value)
+
+    ordered_ranges = (
+        ("market_cap", "min", "max"), ("age", "min", "max"),
+        ("price_change_5m", "min", "max"),
+        ("candidate_market_cap", "min", "max"),
+        ("volume_to_liquidity", "min", "max"),
+        ("sell_impact", "max_pct", "hard_max_pct"),
+        ("tracker_risk_score", "max", "hard_max"),
+        ("snipers", "max_pct", "hard_max_pct"),
+        ("insiders", "max_pct", "hard_max_pct"),
+        ("bundlers", "max_pct", "hard_max_pct"),
+        ("developer_holdings", "max_pct", "hard_max_pct"),
+    )
+    for group, lower, upper in ordered_ranges:
+        if normalized[group][lower] > normalized[group][upper]:
+            raise ValueError(f"{group}: the lower limit cannot be higher than the upper limit.")
+    if normalized["liquidity_ratio"]["hard_min_pct"] > normalized["liquidity_ratio"]["min_pct"]:
+        raise ValueError("liquidity_ratio: hard minimum cannot be higher than Candidate minimum.")
+    return normalized
+
+
+def load_research_filters() -> dict[str, dict[str, Any]]:
+    if not RESEARCH_FILTERS_PATH.exists():
+        return deepcopy(DEFAULT_RESEARCH_FILTERS)
+    try:
+        return normalize_research_filters(json.loads(RESEARCH_FILTERS_PATH.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, ValueError):
+        # A damaged local preference file should never stop the research server.
+        return deepcopy(DEFAULT_RESEARCH_FILTERS)
+
+
+def save_research_filters(raw: Any) -> dict[str, dict[str, Any]]:
+    global ACTIVE_RESEARCH_FILTERS
+    ACTIVE_RESEARCH_FILTERS = normalize_research_filters(raw)
+    RESEARCH_FILTERS_PATH.write_text(json.dumps(ACTIVE_RESEARCH_FILTERS, indent=2) + "\n", encoding="utf-8")
+    return filter_settings()
+
+
+def reset_research_filters() -> dict[str, dict[str, Any]]:
+    global ACTIVE_RESEARCH_FILTERS
+    ACTIVE_RESEARCH_FILTERS = deepcopy(DEFAULT_RESEARCH_FILTERS)
+    try:
+        RESEARCH_FILTERS_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    return filter_settings()
+
+
+ACTIVE_RESEARCH_FILTERS = load_research_filters()
 
 # Fictional fixtures let us review the first candidate feed before any live
 # market, quote, safety, or wallet provider is connected.
@@ -281,6 +387,7 @@ def number(value: Any) -> float:
 
 def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
     """Score a candidate as an explainable research heuristic, never a trade signal."""
+    settings = ACTIVE_RESEARCH_FILTERS
     market_cap = number(candidate.get("market_cap_usd"))
     liquidity = number(candidate.get("liquidity_usd"))
     volume_5m = number(candidate.get("volume_5m_usd"))
@@ -313,56 +420,80 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
     gates: list[dict[str, str]] = []
     hard_failures: list[str] = []
 
-    if 70_000 <= market_cap <= 750_000:
+    market_cap_filter = settings["candidate_market_cap"]
+    market_cap_confirmed = not market_cap_filter["enabled"] or market_cap_filter["min"] <= market_cap <= market_cap_filter["max"]
+    if not market_cap_filter["enabled"]:
+        score += 2
+        gates.append({"label": "Market-cap lane", "status": "OFF", "detail": "Turned off in Research filters; market cap is shown for your review."})
+    elif market_cap_filter["min"] <= market_cap <= market_cap_filter["max"]:
         score += 12
-        gates.append({"label": "Market-cap lane", "status": "PASS", "detail": "Inside the $70k–$750k starter range."})
-    elif 750_000 < market_cap <= 3_000_000:
+        gates.append({"label": "Market-cap lane", "status": "PASS", "detail": f"Inside your ${market_cap_filter['min'] / 1000:.0f}k–${market_cap_filter['max'] / 1000:.0f}k Candidate lane."})
+    elif settings["market_cap"]["enabled"] and settings["market_cap"]["min"] <= market_cap <= settings["market_cap"]["max"]:
         score += 4
         gates.append({"label": "Market-cap lane", "status": "WATCH", "detail": "Outside the primary lane; review manually."})
     else:
         score -= 10
-        gates.append({"label": "Market-cap lane", "status": "FAIL", "detail": "Outside the research range for this first version."})
+        hard_failures.append("market cap is outside your active research range")
+        gates.append({"label": "Market-cap lane", "status": "FAIL", "detail": "Outside your active research range."})
 
-    liquidity_confirmed = liquidity >= MIN_CANDIDATE_LIQUIDITY_USD
-    if liquidity_confirmed:
+    candidate_liquidity = settings["candidate_liquidity"]
+    discovery_liquidity = settings["liquidity"]
+    liquidity_confirmed = not candidate_liquidity["enabled"] or liquidity >= candidate_liquidity["min"]
+    if not candidate_liquidity["enabled"]:
+        score += 2
+        gates.append({"label": "Liquidity", "status": "OFF", "detail": "Candidate-liquidity limit is turned off; shown for manual review."})
+    elif liquidity_confirmed:
         score += 20
-        gates.append({"label": "Liquidity", "status": "PASS", "detail": f"At least ${MIN_CANDIDATE_LIQUIDITY_USD / 1000:.0f}k shown in the pool."})
-    elif liquidity >= 25_000:
+        gates.append({"label": "Liquidity", "status": "PASS", "detail": f"At least ${candidate_liquidity['min'] / 1000:.0f}k shown in the pool."})
+    elif not discovery_liquidity["enabled"] or liquidity >= discovery_liquidity["min"]:
         score += 10
-        gates.append({"label": "Liquidity", "status": "WATCH", "detail": f"Above the $25k discovery minimum, but below the ${MIN_CANDIDATE_LIQUIDITY_USD / 1000:.0f}k Candidate level."})
+        gates.append({"label": "Liquidity", "status": "WATCH", "detail": f"Above the discovery minimum, but below your ${candidate_liquidity['min'] / 1000:.0f}k Candidate level."})
     else:
         score -= 25
-        hard_failures.append("liquidity is below $25k")
-        gates.append({"label": "Liquidity", "status": "FAIL", "detail": "Below the $25k minimum for this scanner."})
+        hard_failures.append(f"liquidity is below ${discovery_liquidity['min'] / 1000:.0f}k")
+        gates.append({"label": "Liquidity", "status": "FAIL", "detail": "Below your active discovery minimum."})
 
-    liquidity_ratio_confirmed = liquidity_ratio >= MIN_CANDIDATE_LIQUIDITY_RATIO
-    if liquidity_ratio_confirmed:
+    liquidity_ratio_filter = settings["liquidity_ratio"]
+    liquidity_ratio_confirmed = not liquidity_ratio_filter["enabled"] or liquidity_ratio >= liquidity_ratio_filter["min_pct"] / 100
+    if not liquidity_ratio_filter["enabled"]:
+        score += 2
+        reasons.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap (ratio filter turned off).")
+    elif liquidity_ratio_confirmed:
         score += 10
-        reasons.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, above the {MIN_CANDIDATE_LIQUIDITY_RATIO * 100:.0f}% target.")
-    elif liquidity_ratio >= 0.10:
+        reasons.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, above your {liquidity_ratio_filter['min_pct']:.0f}% target.")
+    elif liquidity_ratio >= liquidity_ratio_filter["hard_min_pct"] / 100:
         score += 3
-        warnings.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, below the {MIN_CANDIDATE_LIQUIDITY_RATIO * 100:.0f}% Candidate target.")
+        warnings.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, below your {liquidity_ratio_filter['min_pct']:.0f}% Candidate target.")
     else:
         score -= 10
-        hard_failures.append("liquidity is below 10% of market cap")
+        hard_failures.append(f"liquidity is below {liquidity_ratio_filter['hard_min_pct']:.0f}% of market cap")
         warnings.append(f"Liquidity is only {liquidity_ratio * 100:.0f}% of market cap, which can make exits fragile.")
 
-    if DEX_DISCOVERY_MIN_AGE_MINUTES <= age_minutes <= DEX_DISCOVERY_MAX_AGE_MINUTES:
+    age_filter = settings["age"]
+    age_confirmed = not age_filter["enabled"] or age_filter["min"] <= age_minutes <= age_filter["max"]
+    if not age_filter["enabled"]:
+        score += 1
+        gates.append({"label": "Trading age", "status": "OFF", "detail": "Age filter is turned off; age is shown for manual review."})
+    elif age_confirmed:
         score += 5
-        gates.append({"label": "Trading age", "status": "PASS", "detail": f"Observed for {age_minutes:.0f} minutes, inside the 10-minute to 48-hour fresh window."})
+        gates.append({"label": "Trading age", "status": "PASS", "detail": f"Observed for {age_minutes:.0f} minutes, inside your {age_filter['min']:.0f}-minute to {age_filter['max'] / 60:.0f}-hour window."})
     else:
         score -= 10
-        hard_failures.append("the coin is outside the 10-minute to 48-hour fresh window")
+        hard_failures.append("the coin is outside your active fresh-age window")
         gates.append({"label": "Trading age", "status": "FAIL", "detail": "Too new for confirmation or too old for this fresh-momentum lane."})
 
-    volume_quality_confirmed = MIN_VOLUME_TO_LIQUIDITY <= volume_to_liquidity <= MAX_VOLUME_TO_LIQUIDITY
-    if volume_quality_confirmed:
+    turnover_filter = settings["volume_to_liquidity"]
+    volume_quality_confirmed = not turnover_filter["enabled"] or turnover_filter["min"] <= volume_to_liquidity <= turnover_filter["max"]
+    if not turnover_filter["enabled"]:
+        score += 1
+        warnings.append("Five-minute volume/liquidity ratio filter is turned off; inspect turnover manually.")
+    elif volume_quality_confirmed:
         score += 8
         reasons.append("Five-minute volume is active without being extreme relative to displayed liquidity.")
-    elif MIN_VOLUME_TO_LIQUIDITY <= volume_to_liquidity <= HARD_MAX_VOLUME_TO_LIQUIDITY:
+    elif turnover_filter["min"] <= volume_to_liquidity <= turnover_filter["hard_max"]:
         score += 3
         warnings.append("Five-minute volume is unusually high relative to liquidity; treat it as possible manipulation until confirmed.")
-    elif volume_to_liquidity > HARD_MAX_VOLUME_TO_LIQUIDITY:
+    elif volume_to_liquidity > turnover_filter["hard_max"]:
         score -= 20
         hard_failures.append("five-minute volume is extremely high relative to liquidity")
         warnings.append("Extreme turnover can be wash trading or a short-lived spike.")
@@ -371,8 +502,12 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         hard_failures.append("five-minute volume is weak relative to liquidity")
         warnings.append("Five-minute volume is weak relative to liquidity.")
 
-    buy_pressure_confirmed = buy_sell_ratio >= DEX_DISCOVERY_MIN_BUY_SELL_RATIO
-    if buy_sell_ratio >= 1.5:
+    buy_pressure_filter = settings["buy_sell_ratio"]
+    buy_pressure_confirmed = not buy_pressure_filter["enabled"] or buy_sell_ratio >= buy_pressure_filter["min"]
+    if not buy_pressure_filter["enabled"]:
+        score += 1
+        warnings.append("Buy/sell pressure filter is turned off; counts are shown for manual review.")
+    elif buy_sell_ratio >= max(1.5, buy_pressure_filter["min"]):
         score += 12
         reasons.append(f"Buy pressure is {buy_sell_ratio:.1f}× the sell count over five minutes.")
     elif buy_pressure_confirmed:
@@ -380,30 +515,45 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         reasons.append(f"Buy pressure is {buy_sell_ratio:.1f}× the sell count over five minutes.")
     else:
         score -= 8
-        hard_failures.append("buy pressure is below the 1.3× minimum")
+        hard_failures.append(f"buy pressure is below your {buy_pressure_filter['min']:.2f}× minimum")
         warnings.append("Recent sell count exceeds buy count.")
 
-    if sell_quote_status == "no_route":
+    sell_filter = settings["sell_impact"]
+    require_sell_route = settings["require_sell_route"]["enabled"]
+    sell_route_confirmed = not require_sell_route
+    if sell_quote_status == "no_route" and require_sell_route:
         hard_failures.append("Jupiter found no route to sell the small test amount")
         gates.append({"label": "Small sell quote", "status": "FAIL", "detail": sell_quote_note or "No sell route was returned for the small test amount."})
-    elif sell_quote_status in {"unavailable", "not_configured"}:
+    elif sell_quote_status in {"unavailable", "not_configured"} and require_sell_route:
         gates.append({"label": "Small sell quote", "status": "PENDING", "detail": sell_quote_note or "Jupiter quote check needs to be retried."})
         warnings.append("A real small-order sell quote is still required before this could be tradeable.")
-    elif sell_impact is None:
+    elif sell_impact is None and require_sell_route:
         gates.append({"label": "Small sell quote", "status": "PENDING", "detail": "Jupiter quote check is not connected yet."})
         warnings.append("A real small-order sell quote is still required before this could be tradeable.")
-    elif sell_impact <= 2:
+    elif not require_sell_route:
+        gates.append({"label": "Small sell quote", "status": "OFF", "detail": "Sell-route requirement is turned off; any returned quote is displayed as research evidence."})
+    elif not sell_filter["enabled"]:
+        sell_route_confirmed = sell_impact is not None and sell_quote_status == "pass"
+        gates.append({"label": "Small sell quote", "status": "OFF", "detail": "Sell-impact limit is turned off; review the returned quote manually."})
+    elif sell_impact <= sell_filter["max_pct"]:
+        sell_route_confirmed = True
         score += 15
         gates.append({"label": "Small sell quote", "status": "PASS", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
-    elif sell_impact <= 3:
+    elif sell_impact <= sell_filter["hard_max_pct"]:
+        sell_route_confirmed = True
         score += 6
         gates.append({"label": "Small sell quote", "status": "WATCH", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
     else:
         score -= 25
-        hard_failures.append("estimated sell impact is above 3%")
+        hard_failures.append(f"estimated sell impact is above {sell_filter['hard_max_pct']:g}%")
         gates.append({"label": "Small sell quote", "status": "FAIL", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
 
-    if crosscheck_status == "pass":
+    require_crosscheck = settings["require_market_crosscheck"]["enabled"]
+    crosscheck_confirmed = not require_crosscheck
+    if not require_crosscheck:
+        gates.append({"label": "Second market-data source", "status": "OFF", "detail": "Second-source confirmation is turned off; any returned comparison is still displayed."})
+    elif crosscheck_status == "pass":
+        crosscheck_confirmed = True
         if source != "sample":
             score += 6
         gates.append({"label": "Second market-data source", "status": "PASS", "detail": crosscheck_note or "CoinGecko pool data was broadly consistent."})
@@ -421,11 +571,15 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         else:
             score -= 8
             warnings.append("The reclaim pattern is incomplete: wait for a proven run, controlled pullback, and renewed buying.")
-    motion_confirmed = DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT <= price_change <= 20
-    if price_change > DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT:
+    motion_filter = settings["price_change_5m"]
+    motion_confirmed = not motion_filter["enabled"] or motion_filter["min"] <= price_change <= motion_filter["max"]
+    if not motion_filter["enabled"]:
+        score += 1
+        warnings.append("Five-minute momentum filter is turned off; price movement is shown for manual review.")
+    elif price_change > motion_filter["max"]:
         hard_failures.append("five-minute price move is too extended for a fresh entry")
         warnings.append("The price is already vertical; this scanner does not treat a late spike as a Candidate.")
-    elif price_change >= 5:
+    elif price_change >= max(5, motion_filter["min"]):
         score += 8
         reasons.insert(0, f"Price is up {price_change:.1f}% in five minutes with active buyers.")
     else:
@@ -459,9 +613,9 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         warnings.append("Five-minute price momentum is outside the fresh-entry range for a Candidate.")
 
     score = max(0, min(100, round(score)))
-    safety_confirmed = source == "sample" or (safety_status == "pass" and crosscheck_status == "pass")
+    safety_confirmed = source == "sample" or (safety_status == "pass" and crosscheck_confirmed)
     eligible_for_candidate = safety_confirmed and momentum_confirmed and liquidity_confirmed and liquidity_ratio_confirmed \
-        and volume_quality_confirmed and buy_pressure_confirmed
+        and volume_quality_confirmed and buy_pressure_confirmed and market_cap_confirmed and age_confirmed and sell_route_confirmed
     if hard_failures:
         status = "avoid"
     elif score >= 75 and eligible_for_candidate:
@@ -625,6 +779,7 @@ def normalize_dexscreener_pair(pair: dict[str, Any], now: int | None = None) -> 
 
 def discovery_filter_failures(candidate: dict[str, Any]) -> list[str]:
     """Explain exactly why a current pair did not enter the expensive risk pipeline."""
+    settings = ACTIVE_RESEARCH_FILTERS
     market_cap = number(candidate.get("market_cap_usd"))
     liquidity = number(candidate.get("liquidity_usd"))
     age_minutes = number(candidate.get("age_minutes"))
@@ -634,21 +789,21 @@ def discovery_filter_failures(candidate: dict[str, Any]) -> list[str]:
     price_change = number(candidate.get("price_change_5m_pct"))
     buy_sell_ratio = buys / sells if sells else float(buys) if buys else 0
     failures: list[str] = []
-    if not DEX_DISCOVERY_MIN_MARKET_CAP_USD <= market_cap <= DEX_DISCOVERY_MAX_MARKET_CAP_USD:
+    if settings["market_cap"]["enabled"] and not settings["market_cap"]["min"] <= market_cap <= settings["market_cap"]["max"]:
         failures.append("market cap")
-    if liquidity < DEX_DISCOVERY_MIN_LIQUIDITY_USD:
+    if settings["liquidity"]["enabled"] and liquidity < settings["liquidity"]["min"]:
         failures.append("liquidity")
-    if not DEX_DISCOVERY_MIN_AGE_MINUTES <= age_minutes <= DEX_DISCOVERY_MAX_AGE_MINUTES:
+    if settings["age"]["enabled"] and not settings["age"]["min"] <= age_minutes <= settings["age"]["max"]:
         failures.append("age")
-    if volume < DEX_DISCOVERY_MIN_5M_VOLUME_USD:
+    if settings["volume_5m"]["enabled"] and volume < settings["volume_5m"]["min"]:
         failures.append("five-minute volume")
-    if buys + sells < DEX_DISCOVERY_MIN_5M_SWAPS:
+    if settings["swaps_5m"]["enabled"] and buys + sells < settings["swaps_5m"]["min"]:
         failures.append("recent swap count")
-    if buy_sell_ratio < DEX_DISCOVERY_MIN_BUY_SELL_RATIO:
+    if settings["buy_sell_ratio"]["enabled"] and buy_sell_ratio < settings["buy_sell_ratio"]["min"]:
         failures.append("buy pressure")
-    if price_change < DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT:
+    if settings["price_change_5m"]["enabled"] and price_change < settings["price_change_5m"]["min"]:
         failures.append("five-minute momentum")
-    elif price_change > DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT:
+    elif settings["price_change_5m"]["enabled"] and price_change > settings["price_change_5m"]["max"]:
         failures.append("overextended five-minute spike")
     return failures
 
@@ -1232,6 +1387,7 @@ def tracker_percentage(risk: dict[str, Any], key: str) -> float:
 
 def interpret_solana_tracker_risk(token: dict[str, Any]) -> dict[str, Any]:
     """Apply MemeTrace's explicit holder/liquidity policy to public Tracker risk evidence."""
+    settings = ACTIVE_RESEARCH_FILTERS
     risk = token.get("risk")
     if not isinstance(risk, dict) or not risk:
         return {"status": "unavailable", "score": None, "flags": [], "evidence": {},
@@ -1278,29 +1434,30 @@ def interpret_solana_tracker_risk(token: dict[str, Any]) -> dict[str, Any]:
 
     if risk.get("rugged"):
         danger_flags.insert(0, "Solana Tracker: token is marked rugged (no usable liquidity reported)")
-    if score > 6:
-        danger_flags.append(f"Solana Tracker: risk score {score:.1f}/10 is above the 6/10 hard limit")
-    elif score > MAX_TRACKER_RISK_SCORE:
-        watch_flags.append(f"Solana Tracker: risk score {score:.1f}/10 is above the {MAX_TRACKER_RISK_SCORE}/10 Candidate limit")
+    score_filter = settings["tracker_risk_score"]
+    if score_filter["enabled"]:
+        if score > score_filter["hard_max"]:
+            danger_flags.append(f"Solana Tracker: risk score {score:.1f}/10 is above your {score_filter['hard_max']:.1f}/10 hard limit")
+        elif score > score_filter["max"]:
+            watch_flags.append(f"Solana Tracker: risk score {score:.1f}/10 is above your {score_filter['max']:.1f}/10 Candidate limit")
 
-    if top10_pct > MAX_TOP10_HOLDER_PCT:
-        danger_flags.append(f"Solana Tracker: top 10 holders control {top10_pct:.1f}% (limit {MAX_TOP10_HOLDER_PCT}%)")
-    if sniper_pct > 20:
-        danger_flags.append(f"Solana Tracker: early snipers hold {sniper_pct:.1f}% (hard limit 20%)")
-    elif sniper_pct > MAX_SNIPER_PCT:
-        watch_flags.append(f"Solana Tracker: early snipers hold {sniper_pct:.1f}% (Candidate limit {MAX_SNIPER_PCT}%)")
-    if insider_pct > 10:
-        danger_flags.append(f"Solana Tracker: possible insiders hold {insider_pct:.1f}% (hard limit 10%)")
-    elif insider_pct > MAX_INSIDER_PCT:
-        watch_flags.append(f"Solana Tracker: possible insiders hold {insider_pct:.1f}% (Candidate limit {MAX_INSIDER_PCT}%)")
-    if bundler_pct > 15:
-        danger_flags.append(f"Solana Tracker: bundled wallets hold {bundler_pct:.1f}% (hard limit 15%)")
-    elif bundler_pct > MAX_BUNDLER_PCT:
-        watch_flags.append(f"Solana Tracker: bundled wallets hold {bundler_pct:.1f}% (Candidate limit {MAX_BUNDLER_PCT}%)")
-    if developer_pct > 5:
-        danger_flags.append(f"Solana Tracker: developer holdings are {developer_pct:.1f}% (hard limit 5%)")
-    elif developer_pct > MAX_DEVELOPER_PCT:
-        watch_flags.append(f"Solana Tracker: developer holdings are {developer_pct:.1f}% (Candidate limit {MAX_DEVELOPER_PCT}%)")
+    top10_filter = settings["top10_holders"]
+    if top10_filter["enabled"] and top10_pct > top10_filter["max_pct"]:
+        danger_flags.append(f"Solana Tracker: top 10 holders control {top10_pct:.1f}% (limit {top10_filter['max_pct']:.1f}%)")
+
+    def apply_two_level_percentage(setting_name: str, observed: float, label: str) -> None:
+        policy = settings[setting_name]
+        if not policy["enabled"]:
+            return
+        if observed > policy["hard_max_pct"]:
+            danger_flags.append(f"Solana Tracker: {label} {observed:.1f}% (hard limit {policy['hard_max_pct']:.1f}%)")
+        elif observed > policy["max_pct"]:
+            watch_flags.append(f"Solana Tracker: {label} {observed:.1f}% (Candidate limit {policy['max_pct']:.1f}%)")
+
+    apply_two_level_percentage("snipers", sniper_pct, "early snipers hold")
+    apply_two_level_percentage("insiders", insider_pct, "possible insiders hold")
+    apply_two_level_percentage("bundlers", bundler_pct, "bundled wallets hold")
+    apply_two_level_percentage("developer_holdings", developer_pct, "developer holdings are")
 
     status = "avoid" if danger_flags else "watch" if watch_flags else "tracker_pass"
     note_parts = [f"Solana Tracker risk score {score:.1f}/10"]
@@ -1403,14 +1560,15 @@ def fetch_helius_wallet_transactions(address: str) -> list[dict]:
 
 def interpret_helius_wallet_evidence(asset: dict[str, Any], transactions: list[dict], mint: str) -> dict[str, Any]:
     """Summarize public metadata and transfers without claiming a person's identity."""
+    settings = ACTIVE_RESEARCH_FILTERS
     token_info = asset.get("token_info") or {}
     creators = [item.get("address") for item in asset.get("creators") or [] if isinstance(item, dict) and item.get("address")]
     authorities = [item.get("address") for item in asset.get("authorities") or [] if isinstance(item, dict) and item.get("address")]
     creator_address = creators[0] if creators else (authorities[0] if authorities else None)
     static_flags = []
-    if token_info.get("mint_authority"):
+    if settings["active_authority"]["enabled"] and token_info.get("mint_authority"):
         static_flags.append("Helius: mint authority is still present")
-    if token_info.get("freeze_authority"):
+    if settings["active_authority"]["enabled"] and token_info.get("freeze_authority"):
         static_flags.append("Helius: freeze authority is still present")
     outgoing = 0
     incoming = 0
@@ -1435,10 +1593,10 @@ def interpret_helius_wallet_evidence(asset: dict[str, Any], transactions: list[d
     note = f"Helius checked public asset authority metadata. {activity_note}"
     if static_flags:
         status = "avoid"
-    elif creator_address is None:
+    elif settings["creator_activity"]["enabled"] and creator_address is None:
         status = "watch"
         note += " Candidate status is blocked because creator/authority evidence is unavailable."
-    elif outgoing:
+    elif settings["creator_activity"]["enabled"] and outgoing:
         status = "watch"
         note += " Candidate status is blocked until this distribution evidence is reviewed; transfers do not by themselves prove selling or intent."
     else:
@@ -1885,7 +2043,7 @@ class Handler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise ValueError("Request body length is invalid.") from exc
-        if length <= 0 or length > 4_096:
+        if length <= 0 or length > 16_384:
             raise ValueError("A small JSON request body is required.")
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -1904,6 +2062,8 @@ class Handler(SimpleHTTPRequestHandler):
                 table_names = ["wallets", "tokens", "trades", "candidates", "candidate_snapshots"]
                 counts = {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in table_names}
                 return self.json_response(200, {"ok": True, "helius_configured": bool(HELIUS_KEY), "counts": counts})
+            if path == "/api/research-filters":
+                return self.json_response(200, {"filters": filter_settings(), "defaults": deepcopy(DEFAULT_RESEARCH_FILTERS)})
             if path == "/api/candidates":
                 status = params.get("status", [""])[0].strip().lower() or None
                 if status and status not in VALID_STATUSES:
@@ -1938,6 +2098,11 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path, _, _ = self.path.partition("?")
         try:
+            if path == "/api/research-filters":
+                body = self.json_body()
+                return self.json_response(200, {"filters": save_research_filters(body.get("filters", body))})
+            if path == "/api/research-filters/reset":
+                return self.json_response(200, {"filters": reset_research_filters(), "note": "Research filters reset to the starter defaults."})
             if path == "/api/candidates/lookup":
                 body = self.json_body()
                 address = str(body.get("address") or "")
@@ -1966,5 +2131,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     database().close()
     print("MemeTrace running at http://127.0.0.1:8080")
-    print("API: /api/health  /api/candidates  POST /api/candidates/lookup  POST /api/candidates/refresh  POST /api/candidates/full-scan  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
+    print("API: /api/health  /api/research-filters  /api/candidates  POST /api/research-filters  POST /api/research-filters/reset  POST /api/candidates/lookup  POST /api/candidates/refresh  POST /api/candidates/full-scan  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
