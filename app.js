@@ -18,6 +18,8 @@ const elements = {
   detail: document.querySelector('#candidate-detail'),
   dataStatus: document.querySelector('#data-status'),
   fullScan: document.querySelector('#full-scan'),
+  addressInput: document.querySelector('#token-address'),
+  addressSearch: document.querySelector('#address-search'),
   refresh: document.querySelector('#refresh'),
   quoteCheck: document.querySelector('#quote-check'),
   safetyCheck: document.querySelector('#safety-check'),
@@ -250,9 +252,41 @@ async function loadCandidates({ keepButtonDisabled = false } = {}) {
 
 function setResearchControlsDisabled(disabled) {
   [elements.fullScan, elements.refresh, elements.quoteCheck, elements.safetyCheck,
-    elements.walletCheck, elements.crosscheck].forEach((button) => {
+    elements.walletCheck, elements.crosscheck, elements.addressSearch].forEach((button) => {
     button.disabled = disabled;
   });
+  elements.addressInput.disabled = disabled;
+}
+
+async function researchAddress() {
+  const address = elements.addressInput.value.trim();
+  if (!address) {
+    elements.note.textContent = 'Paste a Solana token mint address first.';
+    return;
+  }
+  setResearchControlsDisabled(true);
+  elements.dataStatus.textContent = 'Researching pasted Solana address…';
+  elements.scanSummary.textContent = 'Loading its active pair, sell route, risk, public wallet evidence, and market cross-check…';
+  try {
+    const response = await fetch('/api/candidates/lookup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Address research returned ' + response.status);
+    state.selectedMint = result.candidate.mint;
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = 'Address research: ' + result.candidate.symbol;
+    elements.scanSummary.textContent = result.note;
+    elements.note.textContent = result.note;
+  } catch (error) {
+    elements.dataStatus.textContent = 'Address research unavailable';
+    elements.scanSummary.textContent = error.message;
+    elements.note.textContent = error.message;
+  } finally {
+    setResearchControlsDisabled(false);
+  }
 }
 
 async function runFullResearchScan() {
@@ -411,6 +445,10 @@ elements.list.addEventListener('click', (event) => {
 });
 
 elements.fullScan.addEventListener('click', runFullResearchScan);
+elements.addressSearch.addEventListener('click', researchAddress);
+elements.addressInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') researchAddress();
+});
 elements.refresh.addEventListener('click', refreshCandidates);
 elements.quoteCheck.addEventListener('click', checkSellRoutes);
 elements.safetyCheck.addEventListener('click', checkTokenSafety);
