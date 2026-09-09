@@ -51,6 +51,12 @@ JUPITER_API_BASE = "https://api.jup.ag"
 JUPITER_TEST_SELL_USD = 5
 JUPITER_MAX_QUOTES_PER_CHECK = 3
 SOL_MINT = "So11111111111111111111111111111111111111112"
+SOLANA_TRACKER_API_BASE = "https://data.solanatracker.io"
+SOLANA_TRACKER_API_KEY = os.getenv("SOLANA_TRACKER_API_KEY", "")
+SOLANA_TRACKER_MAX_CHECKS = 3
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_DEMO_API_KEY = os.getenv("COINGECKO_DEMO_API_KEY", "")
+COINGECKO_MAX_CHECKS = 3
 
 # Fictional fixtures let us review the first candidate feed before any live
 # market, quote, safety, or wallet provider is connected.
@@ -142,6 +148,18 @@ def database() -> sqlite3.Connection:
       sell_quote_status TEXT NOT NULL DEFAULT 'pending',
       sell_quote_note TEXT,
       sell_quote_checked_at INTEGER,
+      safety_note TEXT,
+      safety_score REAL,
+      safety_checked_at INTEGER,
+      creator_address TEXT,
+      wallet_evidence_json TEXT NOT NULL DEFAULT '{}',
+      wallet_status TEXT NOT NULL DEFAULT 'pending',
+      wallet_checked_at INTEGER,
+      crosscheck_status TEXT NOT NULL DEFAULT 'pending',
+      crosscheck_note TEXT,
+      crosscheck_price_usd REAL,
+      crosscheck_liquidity_usd REAL,
+      crosscheck_checked_at INTEGER,
       risk_flags_json TEXT NOT NULL DEFAULT '[]',
       safety_status TEXT NOT NULL DEFAULT 'pending',
       observed_at INTEGER NOT NULL,
@@ -174,6 +192,18 @@ def migrate_candidate_columns(conn: sqlite3.Connection) -> None:
         "sell_quote_status": "TEXT NOT NULL DEFAULT 'pending'",
         "sell_quote_note": "TEXT",
         "sell_quote_checked_at": "INTEGER",
+        "safety_note": "TEXT",
+        "safety_score": "REAL",
+        "safety_checked_at": "INTEGER",
+        "creator_address": "TEXT",
+        "wallet_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+        "wallet_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "wallet_checked_at": "INTEGER",
+        "crosscheck_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "crosscheck_note": "TEXT",
+        "crosscheck_price_usd": "REAL",
+        "crosscheck_liquidity_usd": "REAL",
+        "crosscheck_checked_at": "INTEGER",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -236,10 +266,13 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
     risk_flags = candidate.get("risk_flags") or []
     source = candidate.get("source", "unknown")
     safety_status = candidate.get("safety_status", "pending")
+    safety_note = candidate.get("safety_note") or ""
     sell_quote_status = "pass" if source == "sample" and sell_impact is not None else (
         candidate.get("sell_quote_status") or ("pass" if sell_impact is not None else "pending")
     )
     sell_quote_note = candidate.get("sell_quote_note") or ""
+    crosscheck_status = "pass" if source == "sample" else candidate.get("crosscheck_status", "pending")
+    crosscheck_note = candidate.get("crosscheck_note") or ""
 
     liquidity_ratio = liquidity / market_cap if market_cap else 0
     volume_to_liquidity = volume_5m / liquidity if liquidity else 0
@@ -330,6 +363,17 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         hard_failures.append("estimated sell impact is above 3%")
         gates.append({"label": "Small sell quote", "status": "FAIL", "detail": f"Jupiter estimates {sell_impact:.2f}% price impact for a ${JUPITER_TEST_SELL_USD} test sell."})
 
+    if crosscheck_status == "pass":
+        if source != "sample":
+            score += 6
+        gates.append({"label": "Second market-data source", "status": "PASS", "detail": crosscheck_note or "CoinGecko pool data was broadly consistent."})
+    elif crosscheck_status == "mismatch":
+        gates.append({"label": "Second market-data source", "status": "WATCH", "detail": crosscheck_note or "Price or liquidity differed between providers."})
+        warnings.append("Cross-provider market data differs; wait for it to settle before treating this as a candidate.")
+    else:
+        gates.append({"label": "Second market-data source", "status": "PENDING", "detail": crosscheck_note or "CoinGecko pool cross-check is still required."})
+        warnings.append("A second market-data source is still required before a real coin can be labeled Candidate.")
+
     if candidate.get("setup") == "panic_reclaim":
         if previous_high >= 300_000 and 35 <= drawdown_pct <= 70 and price_change >= 3:
             score += 12
@@ -355,13 +399,16 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         warnings.append("This is fictional sample data, not a completed live safety screen.")
     elif safety_status == "pass":
         score += 10
-        gates.append({"label": "Safety / cluster flags", "status": "PASS", "detail": "Live safety check reported no configured hard flags."})
+        gates.append({"label": "Safety / cluster flags", "status": "PASS", "detail": safety_note or "Live safety and wallet checks reported no configured hard flags."})
+    elif safety_status == "tracker_pass":
+        gates.append({"label": "Safety / cluster flags", "status": "WATCH", "detail": safety_note or "Solana Tracker found no configured hard flags; Helius wallet evidence is still pending."})
+        warnings.append("A public creator/wallet evidence check is still required before a real coin can be labeled Candidate.")
     else:
         gates.append({"label": "Safety / cluster flags", "status": "PENDING", "detail": "Live safety check still required."})
         warnings.append("A live safety check is required before a real coin can be labeled Candidate.")
 
     score = max(0, min(100, round(score)))
-    eligible_for_candidate = source == "sample" or safety_status == "pass"
+    eligible_for_candidate = source == "sample" or (safety_status == "pass" and crosscheck_status == "pass")
     if hard_failures:
         status = "avoid"
     elif score >= 75 and eligible_for_candidate:
@@ -397,6 +444,10 @@ def serialize_candidate(row: sqlite3.Row) -> dict[str, Any]:
         candidate["risk_flags"] = json.loads(candidate.pop("risk_flags_json") or "[]")
     except json.JSONDecodeError:
         candidate["risk_flags"] = ["invalid stored risk flag data"]
+    try:
+        candidate["wallet_evidence"] = json.loads(candidate.pop("wallet_evidence_json") or "{}")
+    except json.JSONDecodeError:
+        candidate["wallet_evidence"] = {"error": "invalid stored wallet evidence"}
     candidate.update(candidate_assessment(candidate))
     return candidate
 
@@ -538,8 +589,12 @@ def upsert_candidate(candidate: dict[str, Any], conn: sqlite3.Connection) -> Non
           sells_5m=excluded.sells_5m, age_minutes=excluded.age_minutes,
           price_change_5m_pct=excluded.price_change_5m_pct,
           previous_high_market_cap_usd=excluded.previous_high_market_cap_usd,
-          risk_flags_json=excluded.risk_flags_json,
-          safety_status=excluded.safety_status, observed_at=excluded.observed_at""",
+          sell_impact_pct=NULL, sell_quote_status='pending', sell_quote_note=NULL, sell_quote_checked_at=NULL,
+          safety_note=NULL, safety_score=NULL, safety_checked_at=NULL,
+          creator_address=NULL, wallet_evidence_json='{}', wallet_status='pending', wallet_checked_at=NULL,
+          crosscheck_status='pending', crosscheck_note=NULL, crosscheck_price_usd=NULL,
+          crosscheck_liquidity_usd=NULL, crosscheck_checked_at=NULL,
+          risk_flags_json='[]', safety_status='pending', observed_at=excluded.observed_at""",
         values,
     )
     conn.execute(
@@ -709,6 +764,125 @@ def enrich_jupiter_sellability(fetcher=fetch_jupiter_json, now: int | None = Non
     return summary
 
 
+def fetch_solana_tracker_token(mint: str) -> dict[str, Any]:
+    """Fetch the token risk object from Solana Tracker's Data API."""
+    if not SOLANA_TRACKER_API_KEY:
+        raise ValueError("SOLANA_TRACKER_API_KEY is not set. Add a free Solana Tracker key to .env, then restart the server.")
+    request = urllib.request.Request(
+        f"{SOLANA_TRACKER_API_BASE}/tokens/{urllib.parse.quote(mint)}",
+        headers={"User-Agent": "MemeTrace/0.1 research dashboard", "x-api-key": SOLANA_TRACKER_API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise UpstreamDataError("Solana Tracker sent an unexpected token response.")
+            return data
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"Solana Tracker returned HTTP {exc.code}. Try the safety check again later.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach Solana Tracker. Try the safety check again later.") from exc
+
+
+def interpret_solana_tracker_risk(token: dict[str, Any]) -> dict[str, Any]:
+    """Turn provider evidence into explicit flags; never infer wallet identities."""
+    risk = token.get("risk") or {}
+    raw_risks = risk.get("risks") or []
+    danger_flags = []
+    warning_names = []
+    for item in raw_risks:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or "Unnamed risk"
+        description = item.get("description") or ""
+        level = str(item.get("level") or "").lower()
+        display = f"Solana Tracker: {name}" + (f" — {description}" if description else "")
+        if level == "danger":
+            danger_flags.append(display)
+        elif level == "warning":
+            warning_names.append(name)
+    score = number(risk.get("score"))
+    if risk.get("rugged"):
+        danger_flags.insert(0, "Solana Tracker: token is marked rugged (no usable liquidity reported)")
+    if score >= 7 and not danger_flags:
+        danger_flags.append(f"Solana Tracker: high risk score {score:.1f}/10")
+    note = (
+        f"Solana Tracker risk score {score:.1f}/10. " +
+        (f"Warnings: {', '.join(warning_names[:3])}." if warning_names else "No provider warnings returned.")
+    )
+    return {"status": "avoid" if danger_flags else "tracker_pass", "score": score, "flags": danger_flags[:4], "note": note}
+
+
+def enrich_solana_tracker_risk(fetcher=fetch_solana_tracker_token, now: int | None = None) -> dict[str, Any]:
+    """Check a few sellable cards only, preserving the free API quota for research."""
+    if not SOLANA_TRACKER_API_KEY and fetcher is fetch_solana_tracker_token:
+        return {"checked": 0, "clean": 0, "flagged": 0, "unavailable": 0,
+                "note": "Add a free SOLANA_TRACKER_API_KEY to .env, restart the server, then try again."}
+    now = now or int(time.time())
+    conn = database()
+    rows = conn.execute(
+        """SELECT * FROM candidates WHERE source != 'sample' AND sell_quote_status='pass'
+           ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
+        (SOLANA_TRACKER_MAX_CHECKS,),
+    ).fetchall()
+    summary = {"checked": 0, "clean": 0, "flagged": 0, "unavailable": 0}
+    for row in rows:
+        try:
+            result = interpret_solana_tracker_risk(fetcher(row["mint"]))
+        except (UpstreamDataError, ValueError) as exc:
+            result = {"status": "unavailable", "score": None, "flags": [], "note": str(exc)}
+        conn.execute(
+            """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, safety_score=?,
+               safety_checked_at=? WHERE mint=?""",
+            (json.dumps(result["flags"]), result["status"], result["note"], result["score"], now, row["mint"]),
+        )
+        summary["checked"] += 1
+        if result["status"] == "tracker_pass":
+            summary["clean"] += 1
+        elif result["status"] == "avoid":
+            summary["flagged"] += 1
+        else:
+            summary["unavailable"] += 1
+    conn.commit()
+    summary["note"] = (
+        "Risk results are point-in-time research evidence. Helius creator and wallet evidence is still pending."
+        if summary["checked"] else "Check sell routes first; only cards with a confirmed route are sent to Solana Tracker."
+    )
+    return summary
+
+
+_last_helius_request_at = 0.0
+
+
+def wait_for_helius_rate_limit() -> None:
+    """Free Helius enhanced/DAS APIs allow only a small bounded request rate."""
+    global _last_helius_request_at
+    wait_seconds = 0.55 - (time.monotonic() - _last_helius_request_at)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    _last_helius_request_at = time.monotonic()
+
+
+def fetch_helius_asset(mint: str) -> dict[str, Any]:
+    """Read public DAS token metadata; this is never a wallet connection."""
+    if not HELIUS_KEY:
+        raise ValueError("HELIUS_API_KEY is not set. Add a free Helius key to .env, then restart the server.")
+    url = f"https://mainnet.helius-rpc.com/?{urllib.parse.urlencode({'api-key': HELIUS_KEY})}"
+    body = json.dumps({"jsonrpc": "2.0", "id": "memetrace", "method": "getAsset", "params": {"id": mint}}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "MemeTrace/0.1 research dashboard"})
+    try:
+        wait_for_helius_rate_limit()
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("result"), dict):
+            raise UpstreamDataError("Helius did not return usable asset metadata for this mint.")
+        return payload["result"]
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"Helius returned HTTP {exc.code}. Try the wallet check again later.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach Helius. Try the wallet check again later.") from exc
+
+
 def fetch_helius_wallet_transactions(address: str) -> list[dict]:
     """Fetch parsed public transactions. Key must remain in local environment only."""
     if not HELIUS_KEY:
@@ -716,11 +890,172 @@ def fetch_helius_wallet_transactions(address: str) -> list[dict]:
     query = urllib.parse.urlencode({"api-key": HELIUS_KEY, "limit": 100})
     url = f"https://api.helius.xyz/v0/addresses/{urllib.parse.quote(address)}/transactions?{query}"
     try:
+        wait_for_helius_rate_limit()
         with urllib.request.urlopen(url, timeout=25) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         raise ValueError(f"Helius returned HTTP {exc.code}: {detail[:220]}") from exc
+
+
+def interpret_helius_wallet_evidence(asset: dict[str, Any], transactions: list[dict], mint: str) -> dict[str, Any]:
+    """Summarize public metadata and transfers without claiming a person's identity."""
+    token_info = asset.get("token_info") or {}
+    creators = [item.get("address") for item in asset.get("creators") or [] if isinstance(item, dict) and item.get("address")]
+    authorities = [item.get("address") for item in asset.get("authorities") or [] if isinstance(item, dict) and item.get("address")]
+    creator_address = creators[0] if creators else (authorities[0] if authorities else None)
+    static_flags = []
+    if token_info.get("mint_authority"):
+        static_flags.append("Helius: mint authority is still present")
+    if token_info.get("freeze_authority"):
+        static_flags.append("Helius: freeze authority is still present")
+    outgoing = 0
+    incoming = 0
+    if creator_address:
+        for transaction in transactions:
+            for transfer in transaction.get("tokenTransfers") or []:
+                if transfer.get("mint") != mint:
+                    continue
+                if transfer.get("fromUserAccount") == creator_address:
+                    outgoing += 1
+                if transfer.get("toUserAccount") == creator_address:
+                    incoming += 1
+    evidence = {
+        "creator_or_authority": creator_address,
+        "creator_addresses_observed": len(creators),
+        "authority_addresses_observed": len(authorities),
+        "recent_token_outflows_from_observed_address": outgoing,
+        "recent_token_inflows_to_observed_address": incoming,
+        "warning": "Public address associations and transfers are evidence, not proof of identity, coordination, or intent.",
+    }
+    activity_note = f"Observed {outgoing} recent token outflow(s) from the public creator/authority address." if creator_address else "No creator/authority address was returned in public asset metadata."
+    note = f"Helius checked public asset authority metadata. {activity_note}"
+    return {"status": "avoid" if static_flags else "pass", "flags": static_flags, "note": note, "creator_address": creator_address, "evidence": evidence}
+
+
+def enrich_helius_wallet_evidence(asset_fetcher=fetch_helius_asset, transaction_fetcher=fetch_helius_wallet_transactions, now: int | None = None) -> dict[str, Any]:
+    """Enrich only route-confirmed, token-risk-clean cards with bounded public evidence."""
+    if not HELIUS_KEY and asset_fetcher is fetch_helius_asset:
+        return {"checked": 0, "clear": 0, "flagged": 0, "unavailable": 0,
+                "note": "Add a free HELIUS_API_KEY to .env, restart the server, then try again."}
+    now = now or int(time.time())
+    conn = database()
+    rows = conn.execute(
+        """SELECT * FROM candidates WHERE source != 'sample' AND sell_quote_status='pass'
+           AND safety_status='tracker_pass' ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
+        (SOLANA_TRACKER_MAX_CHECKS,),
+    ).fetchall()
+    summary = {"checked": 0, "clear": 0, "flagged": 0, "unavailable": 0}
+    for row in rows:
+        current_flags = json.loads(row["risk_flags_json"] or "[]")
+        try:
+            asset = asset_fetcher(row["mint"])
+            public_address = next((item.get("address") for item in asset.get("creators") or [] if isinstance(item, dict) and item.get("address")), None)
+            if public_address is None:
+                public_address = next((item.get("address") for item in asset.get("authorities") or [] if isinstance(item, dict) and item.get("address")), None)
+            transactions = transaction_fetcher(public_address) if public_address else []
+            result = interpret_helius_wallet_evidence(asset, transactions, row["mint"])
+        except (UpstreamDataError, ValueError) as exc:
+            result = {"status": "unavailable", "flags": [], "note": str(exc), "creator_address": None, "evidence": {}}
+        flags = (current_flags + result["flags"])[:4]
+        status = result["status"]
+        conn.execute(
+            """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, creator_address=?,
+               wallet_evidence_json=?, wallet_status=?, wallet_checked_at=? WHERE mint=?""",
+            (json.dumps(flags), status, result["note"], result["creator_address"], json.dumps(result["evidence"]), status, now, row["mint"]),
+        )
+        summary["checked"] += 1
+        if status == "pass":
+            summary["clear"] += 1
+        elif status == "avoid":
+            summary["flagged"] += 1
+        else:
+            summary["unavailable"] += 1
+    conn.commit()
+    summary["note"] = (
+        "Helius results are public-chain evidence only. CoinGecko pool cross-checking is still pending."
+        if summary["checked"] else "Check sell routes and token safety first; only clean cards are sent to Helius."
+    )
+    return summary
+
+
+def fetch_coingecko_pool(pair_address: str) -> dict[str, Any]:
+    """Fetch one public on-chain pool record from CoinGecko's Demo API."""
+    if not COINGECKO_DEMO_API_KEY:
+        raise ValueError("COINGECKO_DEMO_API_KEY is not set. Add a free CoinGecko Demo key to .env, then restart the server.")
+    url = f"{COINGECKO_API_BASE}/onchain/networks/solana/pools/{urllib.parse.quote(pair_address)}"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MemeTrace/0.1 research dashboard", "x-cg-demo-api-key": COINGECKO_DEMO_API_KEY},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+            raise UpstreamDataError("CoinGecko did not return usable pool data for this pair.")
+        return data["data"]
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"CoinGecko returned HTTP {exc.code}. Try the cross-check again later.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach CoinGecko. Try the cross-check again later.") from exc
+
+
+def interpret_coingecko_pool(candidate: dict[str, Any], pool: dict[str, Any]) -> dict[str, Any]:
+    """Compare public pool observations rather than treating either provider as ground truth."""
+    attributes = pool.get("attributes") or {}
+    gecko_price = number(attributes.get("base_token_price_usd"))
+    gecko_liquidity = number(attributes.get("reserve_in_usd"))
+    dex_price = number(candidate.get("price_usd"))
+    dex_liquidity = number(candidate.get("liquidity_usd"))
+    if gecko_price <= 0 or dex_price <= 0:
+        return {"status": "unavailable", "price_usd": gecko_price or None, "liquidity_usd": gecko_liquidity or None,
+                "note": "One provider did not return a usable USD price for this pool."}
+    price_gap = abs(dex_price - gecko_price) / dex_price * 100
+    liquidity_gap = abs(dex_liquidity - gecko_liquidity) / dex_liquidity * 100 if dex_liquidity and gecko_liquidity else None
+    mismatched = price_gap > 10 or (liquidity_gap is not None and liquidity_gap > 40)
+    note = f"DEX Screener vs CoinGecko: price differs {price_gap:.1f}%" + (
+        f", liquidity differs {liquidity_gap:.1f}%" if liquidity_gap is not None else ""
+    ) + "."
+    return {"status": "mismatch" if mismatched else "pass", "price_usd": gecko_price,
+            "liquidity_usd": gecko_liquidity or None, "note": note}
+
+
+def enrich_coingecko_crosscheck(fetcher=fetch_coingecko_pool, now: int | None = None) -> dict[str, Any]:
+    """Cross-check only cards that have already passed the first three bounded gates."""
+    if not COINGECKO_DEMO_API_KEY and fetcher is fetch_coingecko_pool:
+        return {"checked": 0, "consistent": 0, "mismatched": 0, "unavailable": 0,
+                "note": "Add a free COINGECKO_DEMO_API_KEY to .env, restart the server, then try again."}
+    now = now or int(time.time())
+    conn = database()
+    rows = conn.execute(
+        """SELECT * FROM candidates WHERE source != 'sample' AND sell_quote_status='pass'
+           AND safety_status='pass' ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
+        (COINGECKO_MAX_CHECKS,),
+    ).fetchall()
+    summary = {"checked": 0, "consistent": 0, "mismatched": 0, "unavailable": 0}
+    for row in rows:
+        try:
+            result = interpret_coingecko_pool(dict(row), fetcher(row["pair_address"]))
+        except (UpstreamDataError, ValueError) as exc:
+            result = {"status": "unavailable", "price_usd": None, "liquidity_usd": None, "note": str(exc)}
+        conn.execute(
+            """UPDATE candidates SET crosscheck_status=?, crosscheck_note=?, crosscheck_price_usd=?,
+               crosscheck_liquidity_usd=?, crosscheck_checked_at=? WHERE mint=?""",
+            (result["status"], result["note"], result["price_usd"], result["liquidity_usd"], now, row["mint"]),
+        )
+        summary["checked"] += 1
+        if result["status"] == "pass":
+            summary["consistent"] += 1
+        elif result["status"] == "mismatch":
+            summary["mismatched"] += 1
+        else:
+            summary["unavailable"] += 1
+    conn.commit()
+    summary["note"] = (
+        "Cross-checks compare two public snapshots and can differ briefly during fast moves; they are not trade advice."
+        if summary["checked"] else "Check sell routes, token safety, and wallet evidence first; only clean cards are sent to CoinGecko."
+    )
+    return summary
 
 
 def ingest_wallet(address: str) -> dict:
@@ -862,6 +1197,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(200, refresh_dexscreener_candidates())
             if path == "/api/candidates/quote-check":
                 return self.json_response(200, enrich_jupiter_sellability())
+            if path == "/api/candidates/safety-check":
+                return self.json_response(200, enrich_solana_tracker_risk())
+            if path == "/api/candidates/wallet-check":
+                return self.json_response(200, enrich_helius_wallet_evidence())
+            if path == "/api/candidates/crosscheck":
+                return self.json_response(200, enrich_coingecko_crosscheck())
         except UpstreamDataError as exc:
             return self.json_response(502, {"error": str(exc)})
         except Exception as exc:  # avoids leaking a stack trace in local browser output
@@ -872,5 +1213,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     database().close()
     print("MemeTrace running at http://127.0.0.1:8080")
-    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  POST /api/candidates/quote-check  /api/cohorts")
+    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
