@@ -1,6 +1,7 @@
 .env
 .env.*
 *.db
+research_filters.json
 __pycache__/
 *.pyc
 node_modules/
