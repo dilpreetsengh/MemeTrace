@@ -31,6 +31,16 @@ discovery pass and every bounded research gate in sequence, then gives one
 plain-English final summary. It remains research-only: it never connects a
 wallet, creates a transaction, or buys a token.
 
+### Research one pasted token address
+
+Paste a **Solana mint address** into the `Research a Solana token address` box
+and click **Research address**. This loads the deepest current Solana DEX pair
+for that exact token even if it did not appear in the discovery feed, then runs
+the available Jupiter, Solana Tracker, Helius, and CoinGecko checks for that
+single token. It will show `Watch` or `Avoid` when the pasted token fails the
+fresh-momentum or safety rules. EVM `0x...` contracts are deliberately rejected
+because this first version is Solana-only.
+
 Live cards are deliberately limited to `Watch`: a Jupiter sell route is useful
 evidence but a token-safety screen is still required. The app therefore cannot
 turn public discovery data into a trade prompt.
@@ -111,6 +121,7 @@ python3 -m unittest -v
 | `GET /api/health` | Confirms local database setup and counts saved records. |
 | `GET /api/candidates` | Returns the ranked candidate feed. |
 | `POST /api/candidates/full-scan` | Runs DEX Screener discovery, then the bounded Jupiter, Solana Tracker, Helius, and CoinGecko checks in order and returns one research-only final summary. |
+| `POST /api/candidates/lookup` | Accepts `{ "address": "<Solana mint>" }`, loads that token's active Solana pair, and runs the available checks on that exact token. |
 | `POST /api/candidates/refresh` | Pulls bounded qualifying Solana cards from DEX Screener, Solana Tracker, and CoinGecko new pools. |
 | `POST /api/candidates/quote-check` | Checks up to three saved live cards for a roughly $5 Jupiter sell route; never sends a transaction. |
 | `POST /api/candidates/safety-check` | Sends route-confirmed cards to Solana Tracker and records point-in-time token-risk evidence. |
