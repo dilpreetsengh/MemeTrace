@@ -3,6 +3,7 @@ const state = {
   candidates: [],
   filter: 'all',
   selectedMint: null,
+  researchFilters: null,
 };
 
 const statusLabels = {
@@ -27,7 +28,56 @@ const elements = {
   crosscheck: document.querySelector('#crosscheck'),
   note: document.querySelector('#feed-note'),
   scanSummary: document.querySelector('#scan-summary'),
+  filterPanel: document.querySelector('#research-filter-panel'),
+  filterStatus: document.querySelector('#filter-status'),
+  researchFilterForm: document.querySelector('#research-filter-form'),
+  researchFilterFields: document.querySelector('#research-filter-fields'),
+  saveResearchFilters: document.querySelector('#save-research-filters'),
+  resetResearchFilters: document.querySelector('#reset-research-filters'),
 };
+
+const researchFilterGroups = [
+  {
+    title: 'Discovery: find coins in motion',
+    description: 'These decide which current pairs enter the expensive research checks.',
+    filters: [
+      { key: 'market_cap', label: 'Market cap', fields: [['min', 'Min $'], ['max', 'Max $']] },
+      { key: 'liquidity', label: 'Liquidity', fields: [['min', 'Min $']] },
+      { key: 'age', label: 'Trading age', fields: [['min', 'Min minutes'], ['max', 'Max minutes']] },
+      { key: 'volume_5m', label: '5-minute volume', fields: [['min', 'Min $']] },
+      { key: 'swaps_5m', label: '5-minute swaps', fields: [['min', 'Min trades']] },
+      { key: 'buy_sell_ratio', label: 'Buy / sell pressure', fields: [['min', 'Min ratio']] },
+      { key: 'price_change_5m', label: '5-minute price move', fields: [['min', 'Min %'], ['max', 'Max %']] },
+    ],
+  },
+  {
+    title: 'Candidate rating and exit quality',
+    description: 'These decide whether a discovered card can graduate from Watch to Candidate.',
+    filters: [
+      { key: 'candidate_market_cap', label: 'Candidate market-cap lane', fields: [['min', 'Min $'], ['max', 'Max $']] },
+      { key: 'candidate_liquidity', label: 'Candidate liquidity', fields: [['min', 'Min $']] },
+      { key: 'liquidity_ratio', label: 'Liquidity / market cap', fields: [['min_pct', 'Candidate min %'], ['hard_min_pct', 'Hard min %']] },
+      { key: 'volume_to_liquidity', label: '5m volume / liquidity', fields: [['min', 'Min ratio'], ['max', 'Candidate max'], ['hard_max', 'Hard max']] },
+      { key: 'sell_impact', label: 'Jupiter sell impact', fields: [['max_pct', 'Candidate max %'], ['hard_max_pct', 'Hard max %']] },
+      { key: 'require_sell_route', label: 'Require Jupiter sell route', fields: [] },
+      { key: 'require_market_crosscheck', label: 'Require CoinGecko cross-check', fields: [] },
+    ],
+  },
+  {
+    title: 'Holder, creator, and authority risk',
+    description: 'These use public Solana Tracker and Helius evidence. Provider danger flags remain visible even if you relax a limit.',
+    filters: [
+      { key: 'tracker_risk_score', label: 'Tracker risk score', fields: [['max', 'Candidate max'], ['hard_max', 'Hard max']] },
+      { key: 'top10_holders', label: 'Top 10 holder concentration', fields: [['max_pct', 'Max %']] },
+      { key: 'snipers', label: 'Early sniper holdings', fields: [['max_pct', 'Candidate max %'], ['hard_max_pct', 'Hard max %']] },
+      { key: 'insiders', label: 'Possible insider holdings', fields: [['max_pct', 'Candidate max %'], ['hard_max_pct', 'Hard max %']] },
+      { key: 'bundlers', label: 'Bundled-wallet holdings', fields: [['max_pct', 'Candidate max %'], ['hard_max_pct', 'Hard max %']] },
+      { key: 'developer_holdings', label: 'Developer holdings', fields: [['max_pct', 'Candidate max %'], ['hard_max_pct', 'Hard max %']] },
+      { key: 'active_authority', label: 'Reject active mint / freeze authority', fields: [] },
+      { key: 'creator_activity', label: 'Require clear creator activity evidence', fields: [] },
+    ],
+  },
+];
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
@@ -66,6 +116,105 @@ function formatSetup(value) {
 function shortAddress(value) {
   if (!value) return 'Not returned';
   return String(value).length > 14 ? String(value).slice(0, 6) + '…' + String(value).slice(-5) : String(value);
+}
+
+function displayFilterNumber(value) {
+  const number = Number(value);
+  return Number.isInteger(number) ? String(number) : String(number);
+}
+
+function renderResearchFilters() {
+  const filters = state.researchFilters;
+  if (!filters) return;
+  const activeCount = Object.values(filters).filter((filter) => filter.enabled).length;
+  elements.filterStatus.textContent = activeCount + '/' + Object.keys(filters).length + ' on';
+  elements.researchFilterFields.innerHTML = researchFilterGroups.map((group) =>
+    '<section class="filter-group"><div class="filter-group-heading"><h3>' + escapeHtml(group.title) +
+      '</h3><p>' + escapeHtml(group.description) + '</p></div><div class="filter-controls">' +
+      group.filters.map((definition) => {
+        const filter = filters[definition.key];
+        if (!filter) return '';
+        const inputFields = definition.fields.map(([field, label]) =>
+          '<label class="filter-number"><span>' + escapeHtml(label) + '</span>' +
+          '<input type="number" min="0" step="any" data-filter-key="' + escapeHtml(definition.key) +
+          '" data-filter-field="' + escapeHtml(field) + '" value="' + escapeHtml(displayFilterNumber(filter[field])) +
+          '"' + (filter.enabled ? '' : ' disabled') + '></label>',
+        ).join('');
+        return '<article class="filter-control" data-filter-control="' + escapeHtml(definition.key) + '">' +
+          '<label class="filter-toggle"><input type="checkbox" data-filter-toggle="' + escapeHtml(definition.key) +
+          '"' + (filter.enabled ? ' checked' : '') + '><span>' + escapeHtml(definition.label) + '</span></label>' +
+          (inputFields ? '<div class="filter-number-fields">' + inputFields + '</div>' : '<small>On/off research gate</small>') +
+          '</article>';
+      }).join('') + '</div></section>',
+  ).join('');
+}
+
+function collectResearchFilters() {
+  const filters = JSON.parse(JSON.stringify(state.researchFilters));
+  elements.researchFilterFields.querySelectorAll('[data-filter-toggle]').forEach((input) => {
+    filters[input.dataset.filterToggle].enabled = input.checked;
+  });
+  elements.researchFilterFields.querySelectorAll('[data-filter-key][data-filter-field]').forEach((input) => {
+    const value = Number(input.value);
+    if (!Number.isFinite(value)) throw new Error('Every enabled limit needs a number.');
+    filters[input.dataset.filterKey][input.dataset.filterField] = value;
+  });
+  return filters;
+}
+
+function setFilterInputsDisabled(key, disabled) {
+  elements.researchFilterFields.querySelectorAll('[data-filter-key="' + CSS.escape(key) + '"]').forEach((input) => {
+    input.disabled = disabled;
+  });
+}
+
+async function loadResearchFilters() {
+  const response = await fetch('/api/research-filters');
+  if (!response.ok) throw new Error('Could not load the research-filter settings.');
+  const result = await response.json();
+  state.researchFilters = result.filters;
+  renderResearchFilters();
+}
+
+async function saveResearchFilters(event) {
+  event.preventDefault();
+  try {
+    const filters = collectResearchFilters();
+    elements.saveResearchFilters.disabled = true;
+    const response = await fetch('/api/research-filters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filters }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save research filters.');
+    state.researchFilters = result.filters;
+    renderResearchFilters();
+    elements.note.textContent = 'Filters saved. Run a new scan to use them; existing cards have been re-rated using the new limits.';
+    await loadCandidates();
+  } catch (error) {
+    elements.note.textContent = error.message;
+  } finally {
+    elements.saveResearchFilters.disabled = false;
+  }
+}
+
+async function resetResearchFilters() {
+  if (!window.confirm('Reset every research filter to the starter limits?')) return;
+  elements.resetResearchFilters.disabled = true;
+  try {
+    const response = await fetch('/api/research-filters/reset', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not reset research filters.');
+    state.researchFilters = result.filters;
+    renderResearchFilters();
+    elements.note.textContent = result.note;
+    await loadCandidates();
+  } catch (error) {
+    elements.note.textContent = error.message;
+  } finally {
+    elements.resetResearchFilters.disabled = false;
+  }
 }
 
 function visibleCandidates() {
@@ -454,4 +603,22 @@ elements.quoteCheck.addEventListener('click', checkSellRoutes);
 elements.safetyCheck.addEventListener('click', checkTokenSafety);
 elements.walletCheck.addEventListener('click', checkWalletEvidence);
 elements.crosscheck.addEventListener('click', crosscheckMarketData);
-loadCandidates();
+elements.researchFilterForm.addEventListener('submit', saveResearchFilters);
+elements.resetResearchFilters.addEventListener('click', resetResearchFilters);
+elements.researchFilterFields.addEventListener('change', (event) => {
+  const toggle = event.target.closest('[data-filter-toggle]');
+  if (!toggle) return;
+  setFilterInputsDisabled(toggle.dataset.filterToggle, !toggle.checked);
+});
+
+async function initialize() {
+  try {
+    await loadResearchFilters();
+  } catch (error) {
+    elements.filterStatus.textContent = 'Unavailable';
+    elements.note.textContent = error.message;
+  }
+  await loadCandidates();
+}
+
+initialize();
