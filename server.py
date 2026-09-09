@@ -46,12 +46,24 @@ DEX_DISCOVERY_MAX_TOKENS = 15
 DEX_DISCOVERY_MIN_MARKET_CAP_USD = 70_000
 DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
 DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
-DEX_DISCOVERY_MIN_AGE_MINUTES = 5
-DEX_DISCOVERY_MAX_AGE_MINUTES = 7 * 24 * 60
+DEX_DISCOVERY_MIN_AGE_MINUTES = 10
+DEX_DISCOVERY_MAX_AGE_MINUTES = 48 * 60
 DEX_DISCOVERY_MIN_5M_VOLUME_USD = 2_000
 DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT = 3
+DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT = 25
 DEX_DISCOVERY_MIN_5M_SWAPS = 10
-DEX_DISCOVERY_MIN_BUY_SELL_RATIO = 1.15
+DEX_DISCOVERY_MIN_BUY_SELL_RATIO = 1.30
+MIN_CANDIDATE_LIQUIDITY_USD = 50_000
+MIN_CANDIDATE_LIQUIDITY_RATIO = 0.15
+MIN_VOLUME_TO_LIQUIDITY = 0.10
+MAX_VOLUME_TO_LIQUIDITY = 2.00
+HARD_MAX_VOLUME_TO_LIQUIDITY = 5.00
+MAX_TRACKER_RISK_SCORE = 3
+MAX_TOP10_HOLDER_PCT = 15
+MAX_SNIPER_PCT = 10
+MAX_INSIDER_PCT = 5
+MAX_BUNDLER_PCT = 5
+MAX_DEVELOPER_PCT = 1
 LIVE_CANDIDATE_TTL_SECONDS = 15 * 60
 JUPITER_API_BASE = "https://api.jup.ag"
 JUPITER_TEST_SELL_USD = 5
@@ -94,7 +106,7 @@ SAMPLE_CANDIDATES: list[dict[str, Any]] = [
         "mint": "sample-pigeon-protocol", "name": "Pigeon Protocol", "symbol": "PIGEON",
         "chain": "solana", "pair_address": "sample-pair-pigeon", "source": "sample",
         "setup": "early_momentum", "market_cap_usd": 132_000, "liquidity_usd": 31_000,
-        "volume_5m_usd": 7_100, "buys_5m": 39, "sells_5m": 34, "age_minutes": 9,
+        "volume_5m_usd": 7_100, "buys_5m": 50, "sells_5m": 34, "age_minutes": 12,
         "price_change_5m_pct": 2.1, "previous_high_market_cap_usd": None,
         "sell_impact_pct": 2.6, "risk_flags": [], "safety_status": "sample",
     },
@@ -164,6 +176,7 @@ def database() -> sqlite3.Connection:
       safety_note TEXT,
       safety_score REAL,
       safety_checked_at INTEGER,
+      risk_evidence_json TEXT NOT NULL DEFAULT '{}',
       creator_address TEXT,
       wallet_evidence_json TEXT NOT NULL DEFAULT '{}',
       wallet_status TEXT NOT NULL DEFAULT 'pending',
@@ -208,6 +221,7 @@ def migrate_candidate_columns(conn: sqlite3.Connection) -> None:
         "safety_note": "TEXT",
         "safety_score": "REAL",
         "safety_checked_at": "INTEGER",
+        "risk_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
         "creator_address": "TEXT",
         "wallet_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
         "wallet_status": "TEXT NOT NULL DEFAULT 'pending'",
@@ -308,52 +322,64 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         score -= 10
         gates.append({"label": "Market-cap lane", "status": "FAIL", "detail": "Outside the research range for this first version."})
 
-    if liquidity >= 50_000:
+    liquidity_confirmed = liquidity >= MIN_CANDIDATE_LIQUIDITY_USD
+    if liquidity_confirmed:
         score += 20
-        gates.append({"label": "Liquidity", "status": "PASS", "detail": "At least $50k shown in the fixture."})
+        gates.append({"label": "Liquidity", "status": "PASS", "detail": f"At least ${MIN_CANDIDATE_LIQUIDITY_USD / 1000:.0f}k shown in the pool."})
     elif liquidity >= 25_000:
         score += 10
-        gates.append({"label": "Liquidity", "status": "WATCH", "detail": "Above the $25k minimum, but below the stronger $50k level."})
+        gates.append({"label": "Liquidity", "status": "WATCH", "detail": f"Above the $25k discovery minimum, but below the ${MIN_CANDIDATE_LIQUIDITY_USD / 1000:.0f}k Candidate level."})
     else:
         score -= 25
         hard_failures.append("liquidity is below $25k")
         gates.append({"label": "Liquidity", "status": "FAIL", "detail": "Below the $25k minimum for this scanner."})
 
-    if liquidity_ratio >= 0.10:
+    liquidity_ratio_confirmed = liquidity_ratio >= MIN_CANDIDATE_LIQUIDITY_RATIO
+    if liquidity_ratio_confirmed:
         score += 10
-        reasons.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, above the 10% target.")
-    elif liquidity_ratio >= 0.07:
+        reasons.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, above the {MIN_CANDIDATE_LIQUIDITY_RATIO * 100:.0f}% target.")
+    elif liquidity_ratio >= 0.10:
         score += 3
-        warnings.append(f"Liquidity is only {liquidity_ratio * 100:.0f}% of market cap.")
+        warnings.append(f"Liquidity is {liquidity_ratio * 100:.0f}% of market cap, below the {MIN_CANDIDATE_LIQUIDITY_RATIO * 100:.0f}% Candidate target.")
     else:
         score -= 10
+        hard_failures.append("liquidity is below 10% of market cap")
         warnings.append(f"Liquidity is only {liquidity_ratio * 100:.0f}% of market cap, which can make exits fragile.")
 
-    if age_minutes >= 5:
+    if DEX_DISCOVERY_MIN_AGE_MINUTES <= age_minutes <= DEX_DISCOVERY_MAX_AGE_MINUTES:
         score += 5
-        gates.append({"label": "Trading age", "status": "PASS", "detail": f"Observed for {age_minutes:.0f} minutes, beyond the 5-minute wait."})
+        gates.append({"label": "Trading age", "status": "PASS", "detail": f"Observed for {age_minutes:.0f} minutes, inside the 10-minute to 48-hour fresh window."})
     else:
         score -= 10
-        hard_failures.append("the coin is younger than 5 minutes")
-        gates.append({"label": "Trading age", "status": "FAIL", "detail": "Too new for the first observation rule."})
+        hard_failures.append("the coin is outside the 10-minute to 48-hour fresh window")
+        gates.append({"label": "Trading age", "status": "FAIL", "detail": "Too new for confirmation or too old for this fresh-momentum lane."})
 
-    if volume_to_liquidity >= 0.25:
+    volume_quality_confirmed = MIN_VOLUME_TO_LIQUIDITY <= volume_to_liquidity <= MAX_VOLUME_TO_LIQUIDITY
+    if volume_quality_confirmed:
         score += 8
-        reasons.append("Five-minute volume is active relative to displayed liquidity.")
-    elif volume_to_liquidity >= 0.10:
+        reasons.append("Five-minute volume is active without being extreme relative to displayed liquidity.")
+    elif MIN_VOLUME_TO_LIQUIDITY <= volume_to_liquidity <= HARD_MAX_VOLUME_TO_LIQUIDITY:
         score += 3
+        warnings.append("Five-minute volume is unusually high relative to liquidity; treat it as possible manipulation until confirmed.")
+    elif volume_to_liquidity > HARD_MAX_VOLUME_TO_LIQUIDITY:
+        score -= 20
+        hard_failures.append("five-minute volume is extremely high relative to liquidity")
+        warnings.append("Extreme turnover can be wash trading or a short-lived spike.")
     else:
         score -= 4
+        hard_failures.append("five-minute volume is weak relative to liquidity")
         warnings.append("Five-minute volume is weak relative to liquidity.")
 
+    buy_pressure_confirmed = buy_sell_ratio >= DEX_DISCOVERY_MIN_BUY_SELL_RATIO
     if buy_sell_ratio >= 1.5:
         score += 12
         reasons.append(f"Buy pressure is {buy_sell_ratio:.1f}× the sell count over five minutes.")
-    elif buy_sell_ratio >= 1:
+    elif buy_pressure_confirmed:
         score += 4
-        reasons.append("Buy and sell counts are balanced, not strongly one-sided.")
+        reasons.append(f"Buy pressure is {buy_sell_ratio:.1f}× the sell count over five minutes.")
     else:
         score -= 8
+        hard_failures.append("buy pressure is below the 1.3× minimum")
         warnings.append("Recent sell count exceeds buy count.")
 
     if sell_quote_status == "no_route":
@@ -394,12 +420,16 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
         else:
             score -= 8
             warnings.append("The reclaim pattern is incomplete: wait for a proven run, controlled pullback, and renewed buying.")
+    motion_confirmed = DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT <= price_change <= 20
+    if price_change > DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT:
+        hard_failures.append("five-minute price move is too extended for a fresh entry")
+        warnings.append("The price is already vertical; this scanner does not treat a late spike as a Candidate.")
     elif price_change >= 5:
         score += 8
-        reasons.insert(0, f"Price is up {price_change:.1f}% in five minutes while the fixture shows active buyers.")
+        reasons.insert(0, f"Price is up {price_change:.1f}% in five minutes with active buyers.")
     else:
         score += 2
-        warnings.append("Momentum is present but not yet strong enough for a high-conviction watch.")
+        warnings.append("Momentum is present but not yet inside the preferred fresh-entry range.")
 
     if risk_flags:
         score -= 35
@@ -416,18 +446,21 @@ def candidate_assessment(candidate: dict[str, Any]) -> dict[str, Any]:
     elif safety_status == "tracker_pass":
         gates.append({"label": "Safety / cluster flags", "status": "WATCH", "detail": safety_note or "Solana Tracker found no configured hard flags; Helius wallet evidence is still pending."})
         warnings.append("A public creator/wallet evidence check is still required before a real coin can be labeled Candidate.")
+    elif safety_status == "watch":
+        gates.append({"label": "Safety / cluster flags", "status": "WATCH", "detail": safety_note or "A non-fatal holder, liquidity, or creator-distribution warning needs review."})
+        warnings.append("A risk warning blocks Candidate status until it clears on a later scan.")
     else:
         gates.append({"label": "Safety / cluster flags", "status": "PENDING", "detail": "Live safety check still required."})
         warnings.append("A live safety check is required before a real coin can be labeled Candidate.")
 
-    momentum_confirmed = source == "sample" or price_change >= DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT
+    momentum_confirmed = source == "sample" or motion_confirmed
     if source != "sample" and not momentum_confirmed:
-        warnings.append("Five-minute price momentum is below the minimum for a fresh trending candidate.")
+        warnings.append("Five-minute price momentum is outside the fresh-entry range for a Candidate.")
 
     score = max(0, min(100, round(score)))
-    eligible_for_candidate = source == "sample" or (
-        safety_status == "pass" and crosscheck_status == "pass" and momentum_confirmed
-    )
+    safety_confirmed = source == "sample" or (safety_status == "pass" and crosscheck_status == "pass")
+    eligible_for_candidate = safety_confirmed and momentum_confirmed and liquidity_confirmed and liquidity_ratio_confirmed \
+        and volume_quality_confirmed and buy_pressure_confirmed
     if hard_failures:
         status = "avoid"
     elif score >= 75 and eligible_for_candidate:
@@ -463,6 +496,10 @@ def serialize_candidate(row: sqlite3.Row) -> dict[str, Any]:
         candidate["risk_flags"] = json.loads(candidate.pop("risk_flags_json") or "[]")
     except json.JSONDecodeError:
         candidate["risk_flags"] = ["invalid stored risk flag data"]
+    try:
+        candidate["risk_evidence"] = json.loads(candidate.pop("risk_evidence_json") or "{}")
+    except json.JSONDecodeError:
+        candidate["risk_evidence"] = {"error": "invalid stored risk evidence"}
     try:
         candidate["wallet_evidence"] = json.loads(candidate.pop("wallet_evidence_json") or "{}")
     except json.JSONDecodeError:
@@ -598,7 +635,7 @@ def passes_dex_discovery_filter(candidate: dict[str, Any]) -> bool:
         and number(candidate["volume_5m_usd"]) >= DEX_DISCOVERY_MIN_5M_VOLUME_USD
         and buys + sells >= DEX_DISCOVERY_MIN_5M_SWAPS
         and buy_sell_ratio >= DEX_DISCOVERY_MIN_BUY_SELL_RATIO
-        and number(candidate["price_change_5m_pct"]) >= DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT
+        and DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT <= number(candidate["price_change_5m_pct"]) <= DEX_DISCOVERY_MAX_5M_PRICE_CHANGE_PCT
     )
 
 
@@ -629,7 +666,7 @@ def upsert_candidate(candidate: dict[str, Any], conn: sqlite3.Connection) -> Non
           price_change_5m_pct=excluded.price_change_5m_pct,
           previous_high_market_cap_usd=excluded.previous_high_market_cap_usd,
           sell_impact_pct=NULL, sell_quote_status='pending', sell_quote_note=NULL, sell_quote_checked_at=NULL,
-          safety_note=NULL, safety_score=NULL, safety_checked_at=NULL,
+          safety_note=NULL, safety_score=NULL, safety_checked_at=NULL, risk_evidence_json='{}',
           creator_address=NULL, wallet_evidence_json='{}', wallet_status='pending', wallet_checked_at=NULL,
           crosscheck_status='pending', crosscheck_note=NULL, crosscheck_price_usd=NULL,
           crosscheck_liquidity_usd=NULL, crosscheck_checked_at=NULL,
@@ -1091,39 +1128,102 @@ def fetch_solana_tracker_token(mint: str) -> dict[str, Any]:
         raise UpstreamDataError("Could not reach Solana Tracker. Try the safety check again later.") from exc
 
 
+def tracker_percentage(risk: dict[str, Any], key: str) -> float:
+    """Read a percentage from a documented Tracker risk sub-object without guessing identities."""
+    value = risk.get(key) or {}
+    if isinstance(value, dict):
+        return number(value.get("totalPercentage") if value.get("totalPercentage") is not None else value.get("percentage"))
+    return number(value)
+
+
 def interpret_solana_tracker_risk(token: dict[str, Any]) -> dict[str, Any]:
-    """Turn provider evidence into explicit flags; never infer wallet identities."""
-    risk = token.get("risk") or {}
+    """Apply MemeTrace's explicit holder/liquidity policy to public Tracker risk evidence."""
+    risk = token.get("risk")
+    if not isinstance(risk, dict) or not risk:
+        return {"status": "unavailable", "score": None, "flags": [], "evidence": {},
+                "note": "Solana Tracker did not return a usable risk object for this token."}
+
     raw_risks = risk.get("risks") or []
-    danger_flags = []
-    warning_names = []
+    danger_flags: list[str] = []
+    watch_flags: list[str] = []
+    provider_warnings: list[str] = []
+    lp_or_curve_status = "No LP or bonding-curve risk was returned"
     for item in raw_risks:
         if not isinstance(item, dict):
             continue
-        name = item.get("name") or "Unnamed risk"
-        description = item.get("description") or ""
+        name = str(item.get("name") or "Unnamed risk")
+        description = str(item.get("description") or "")
         level = str(item.get("level") or "").lower()
+        lower_name = name.lower()
         display = f"Solana Tracker: {name}" + (f" — {description}" if description else "")
+        if "liquidity" in lower_name or "lp" in lower_name or "bonding curve" in lower_name:
+            lp_or_curve_status = name
         if level == "danger":
             danger_flags.append(display)
         elif level == "warning":
-            warning_names.append(name)
+            provider_warnings.append(name)
+            if any(term in lower_name for term in ("incomplete bonding curve", "transitioning", "suspicious volume", "price decrease", "dynamic fee", "liquidity", "lp")):
+                watch_flags.append(display)
+
     score = number(risk.get("score"))
+    top10_pct = number(risk.get("top10"))
+    sniper_pct = tracker_percentage(risk, "snipers")
+    insider_pct = tracker_percentage(risk, "insiders")
+    bundler_pct = tracker_percentage(risk, "bundlers")
+    developer_pct = tracker_percentage(risk, "dev")
+    evidence = {
+        "risk_score": score,
+        "top_10_holder_pct": top10_pct,
+        "sniper_holder_pct": sniper_pct,
+        "insider_holder_pct": insider_pct,
+        "bundler_holder_pct": bundler_pct,
+        "developer_holder_pct": developer_pct,
+        "lp_or_curve_status": lp_or_curve_status,
+        "provider_warnings": provider_warnings[:6],
+    }
+
     if risk.get("rugged"):
         danger_flags.insert(0, "Solana Tracker: token is marked rugged (no usable liquidity reported)")
-    if score >= 7 and not danger_flags:
-        danger_flags.append(f"Solana Tracker: high risk score {score:.1f}/10")
-    note = (
-        f"Solana Tracker risk score {score:.1f}/10. " +
-        (f"Warnings: {', '.join(warning_names[:3])}." if warning_names else "No provider warnings returned.")
-    )
-    return {"status": "avoid" if danger_flags else "tracker_pass", "score": score, "flags": danger_flags[:4], "note": note}
+    if score > 6:
+        danger_flags.append(f"Solana Tracker: risk score {score:.1f}/10 is above the 6/10 hard limit")
+    elif score > MAX_TRACKER_RISK_SCORE:
+        watch_flags.append(f"Solana Tracker: risk score {score:.1f}/10 is above the {MAX_TRACKER_RISK_SCORE}/10 Candidate limit")
+
+    if top10_pct > MAX_TOP10_HOLDER_PCT:
+        danger_flags.append(f"Solana Tracker: top 10 holders control {top10_pct:.1f}% (limit {MAX_TOP10_HOLDER_PCT}%)")
+    if sniper_pct > 20:
+        danger_flags.append(f"Solana Tracker: early snipers hold {sniper_pct:.1f}% (hard limit 20%)")
+    elif sniper_pct > MAX_SNIPER_PCT:
+        watch_flags.append(f"Solana Tracker: early snipers hold {sniper_pct:.1f}% (Candidate limit {MAX_SNIPER_PCT}%)")
+    if insider_pct > 10:
+        danger_flags.append(f"Solana Tracker: possible insiders hold {insider_pct:.1f}% (hard limit 10%)")
+    elif insider_pct > MAX_INSIDER_PCT:
+        watch_flags.append(f"Solana Tracker: possible insiders hold {insider_pct:.1f}% (Candidate limit {MAX_INSIDER_PCT}%)")
+    if bundler_pct > 15:
+        danger_flags.append(f"Solana Tracker: bundled wallets hold {bundler_pct:.1f}% (hard limit 15%)")
+    elif bundler_pct > MAX_BUNDLER_PCT:
+        watch_flags.append(f"Solana Tracker: bundled wallets hold {bundler_pct:.1f}% (Candidate limit {MAX_BUNDLER_PCT}%)")
+    if developer_pct > 5:
+        danger_flags.append(f"Solana Tracker: developer holdings are {developer_pct:.1f}% (hard limit 5%)")
+    elif developer_pct > MAX_DEVELOPER_PCT:
+        watch_flags.append(f"Solana Tracker: developer holdings are {developer_pct:.1f}% (Candidate limit {MAX_DEVELOPER_PCT}%)")
+
+    status = "avoid" if danger_flags else "watch" if watch_flags else "tracker_pass"
+    note_parts = [f"Solana Tracker risk score {score:.1f}/10"]
+    if watch_flags:
+        note_parts.append("Warnings: " + "; ".join(watch_flags[:3]))
+    elif provider_warnings:
+        note_parts.append("Provider warnings: " + ", ".join(provider_warnings[:3]))
+    else:
+        note_parts.append("No configured holder, LP, or volume warnings returned")
+    return {"status": status, "score": score, "flags": danger_flags[:6], "evidence": evidence,
+            "note": ". ".join(note_parts) + "."}
 
 
 def enrich_solana_tracker_risk(fetcher=fetch_solana_tracker_token, now: int | None = None) -> dict[str, Any]:
     """Check a few sellable cards only, preserving the free API quota for research."""
     if not SOLANA_TRACKER_API_KEY and fetcher is fetch_solana_tracker_token:
-        return {"checked": 0, "clean": 0, "flagged": 0, "unavailable": 0,
+        return {"checked": 0, "clean": 0, "watch": 0, "flagged": 0, "unavailable": 0,
                 "note": "Add a free SOLANA_TRACKER_API_KEY to .env, restart the server, then try again."}
     now = now or int(time.time())
     conn = database()
@@ -1132,20 +1232,22 @@ def enrich_solana_tracker_risk(fetcher=fetch_solana_tracker_token, now: int | No
            ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
         (now - LIVE_CANDIDATE_TTL_SECONDS, SOLANA_TRACKER_MAX_CHECKS),
     ).fetchall()
-    summary = {"checked": 0, "clean": 0, "flagged": 0, "unavailable": 0}
+    summary = {"checked": 0, "clean": 0, "watch": 0, "flagged": 0, "unavailable": 0}
     for row in rows:
         try:
             result = interpret_solana_tracker_risk(fetcher(row["mint"]))
         except (UpstreamDataError, ValueError) as exc:
-            result = {"status": "unavailable", "score": None, "flags": [], "note": str(exc)}
+            result = {"status": "unavailable", "score": None, "flags": [], "evidence": {}, "note": str(exc)}
         conn.execute(
-            """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, safety_score=?,
+            """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, safety_score=?, risk_evidence_json=?,
                safety_checked_at=? WHERE mint=?""",
-            (json.dumps(result["flags"]), result["status"], result["note"], result["score"], now, row["mint"]),
+            (json.dumps(result["flags"]), result["status"], result["note"], result["score"], json.dumps(result["evidence"]), now, row["mint"]),
         )
         summary["checked"] += 1
         if result["status"] == "tracker_pass":
             summary["clean"] += 1
+        elif result["status"] == "watch":
+            summary["watch"] += 1
         elif result["status"] == "avoid":
             summary["flagged"] += 1
         else:
@@ -1237,22 +1339,32 @@ def interpret_helius_wallet_evidence(asset: dict[str, Any], transactions: list[d
     }
     activity_note = f"Observed {outgoing} recent token outflow(s) from the public creator/authority address." if creator_address else "No creator/authority address was returned in public asset metadata."
     note = f"Helius checked public asset authority metadata. {activity_note}"
-    return {"status": "avoid" if static_flags else "pass", "flags": static_flags, "note": note, "creator_address": creator_address, "evidence": evidence}
+    if static_flags:
+        status = "avoid"
+    elif creator_address is None:
+        status = "watch"
+        note += " Candidate status is blocked because creator/authority evidence is unavailable."
+    elif outgoing:
+        status = "watch"
+        note += " Candidate status is blocked until this distribution evidence is reviewed; transfers do not by themselves prove selling or intent."
+    else:
+        status = "pass"
+    return {"status": status, "flags": static_flags, "note": note, "creator_address": creator_address, "evidence": evidence}
 
 
 def enrich_helius_wallet_evidence(asset_fetcher=fetch_helius_asset, transaction_fetcher=fetch_helius_wallet_transactions, now: int | None = None) -> dict[str, Any]:
     """Enrich only route-confirmed, token-risk-clean cards with bounded public evidence."""
     if not HELIUS_KEY and asset_fetcher is fetch_helius_asset:
-        return {"checked": 0, "clear": 0, "flagged": 0, "unavailable": 0,
+        return {"checked": 0, "clear": 0, "watch": 0, "flagged": 0, "unavailable": 0,
                 "note": "Add a free HELIUS_API_KEY to .env, restart the server, then try again."}
     now = now or int(time.time())
     conn = database()
     rows = conn.execute(
         """SELECT * FROM candidates WHERE source != 'sample' AND observed_at >= ? AND sell_quote_status='pass'
-           AND safety_status='tracker_pass' ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
+           AND safety_status IN ('tracker_pass', 'watch') ORDER BY liquidity_usd DESC, observed_at DESC LIMIT ?""",
         (now - LIVE_CANDIDATE_TTL_SECONDS, SOLANA_TRACKER_MAX_CHECKS),
     ).fetchall()
-    summary = {"checked": 0, "clear": 0, "flagged": 0, "unavailable": 0}
+    summary = {"checked": 0, "clear": 0, "watch": 0, "flagged": 0, "unavailable": 0}
     for row in rows:
         current_flags = json.loads(row["risk_flags_json"] or "[]")
         try:
@@ -1265,17 +1377,21 @@ def enrich_helius_wallet_evidence(asset_fetcher=fetch_helius_asset, transaction_
         except (UpstreamDataError, ValueError) as exc:
             result = {"status": "unavailable", "flags": [], "note": str(exc), "creator_address": None, "evidence": {}}
         flags = (current_flags + result["flags"])[:4]
-        status = result["status"]
+        tracker_was_watch = row["safety_status"] == "watch"
+        status = "avoid" if result["status"] == "avoid" else "watch" if tracker_was_watch or result["status"] == "watch" else result["status"]
+        note = (row["safety_note"] + " " if tracker_was_watch and row["safety_note"] else "") + result["note"]
         conn.execute(
             """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, creator_address=?,
                wallet_evidence_json=?, wallet_status=?, wallet_checked_at=? WHERE mint=?""",
-            (json.dumps(flags), status, result["note"], result["creator_address"], json.dumps(result["evidence"]), status, now, row["mint"]),
+            (json.dumps(flags), status, note, result["creator_address"], json.dumps(result["evidence"]), status, now, row["mint"]),
         )
         summary["checked"] += 1
         if status == "pass":
             summary["clear"] += 1
         elif status == "avoid":
             summary["flagged"] += 1
+        elif status == "watch":
+            summary["watch"] += 1
         else:
             summary["unavailable"] += 1
     conn.commit()
