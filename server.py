@@ -1575,6 +1575,118 @@ def enrich_coingecko_crosscheck(fetcher=fetch_coingecko_pool, now: int | None = 
     return summary
 
 
+def validate_solana_mint(address: str) -> str:
+    """Accept a pasted Solana mint without treating an EVM contract as a Solana token."""
+    mint = address.strip()
+    if mint.startswith("0x"):
+        raise ValueError("That is an EVM 0x contract. Address research is Solana-only in this version.")
+    alphabet = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+    if not 32 <= len(mint) <= 64 or any(character not in alphabet for character in mint):
+        raise ValueError("Paste a valid Solana token mint address.")
+    return mint
+
+
+def research_token_address(
+    address: str,
+    pair_fetcher=fetch_dexscreener_json,
+    now: int | None = None,
+    run_deep_checks: bool = True,
+) -> dict[str, Any]:
+    """Research one pasted Solana mint without requiring it to pass discovery first."""
+    mint = validate_solana_mint(address)
+    now = now or int(time.time())
+    pairs = pair_fetcher(f"{DEX_SCREENER_API_BASE}/token-pairs/v1/solana/{urllib.parse.quote(mint)}")
+    if not isinstance(pairs, list):
+        raise UpstreamDataError("DEX Screener returned an unexpected token-pair response.")
+    candidates = [normalize_dexscreener_pair(pair, now) for pair in pairs if isinstance(pair, dict)]
+    candidates = [candidate for candidate in candidates if candidate is not None]
+    if not candidates:
+        raise ValueError("No Solana DEX pair was found for that address yet.")
+    selected = max(candidates, key=lambda candidate: number(candidate["liquidity_usd"]))
+    selected["source"] = "address_lookup"
+    conn = database()
+    upsert_candidate(selected, conn)
+    conn.commit()
+
+    stages: dict[str, dict[str, Any]] = {}
+    if not run_deep_checks:
+        return {"candidate": candidate_detail(mint), "stages": stages,
+                "note": "Pair data loaded. Deep research checks were not run."}
+
+    if not JUPITER_API_KEY:
+        stages["sell_route"] = {"status": "not_configured", "note": "Jupiter key is not configured."}
+    else:
+        quote = check_jupiter_sell_quote(selected)
+        conn.execute(
+            """UPDATE candidates SET sell_impact_pct=?, sell_quote_status=?, sell_quote_note=?, sell_quote_checked_at=? WHERE mint=?""",
+            (quote["impact_pct"], quote["status"], quote["note"], now, mint),
+        )
+        conn.commit()
+        stages["sell_route"] = {"status": quote["status"], "note": quote["note"]}
+
+    row = conn.execute("SELECT * FROM candidates WHERE mint=?", (mint,)).fetchone()
+    if row and row["sell_quote_status"] == "pass" and SOLANA_TRACKER_API_KEY:
+        tracker = interpret_solana_tracker_risk(fetch_solana_tracker_token(mint))
+        conn.execute(
+            """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, safety_score=?, risk_evidence_json=?,
+               safety_checked_at=? WHERE mint=?""",
+            (json.dumps(tracker["flags"]), tracker["status"], tracker["note"], tracker["score"],
+             json.dumps(tracker["evidence"]), now, mint),
+        )
+        conn.commit()
+        stages["token_safety"] = {"status": tracker["status"], "note": tracker["note"]}
+    elif not SOLANA_TRACKER_API_KEY:
+        stages["token_safety"] = {"status": "not_configured", "note": "Solana Tracker key is not configured."}
+    else:
+        stages["token_safety"] = {"status": "skipped", "note": "A usable Jupiter sell route is required before the safety check."}
+
+    row = conn.execute("SELECT * FROM candidates WHERE mint=?", (mint,)).fetchone()
+    if row and row["safety_status"] in {"tracker_pass", "watch"} and HELIUS_KEY:
+        current_flags = json.loads(row["risk_flags_json"] or "[]")
+        asset = fetch_helius_asset(mint)
+        public_address = next((item.get("address") for item in asset.get("creators") or [] if isinstance(item, dict) and item.get("address")), None)
+        if public_address is None:
+            public_address = next((item.get("address") for item in asset.get("authorities") or [] if isinstance(item, dict) and item.get("address")), None)
+        transactions = fetch_helius_wallet_transactions(public_address) if public_address else []
+        wallet = interpret_helius_wallet_evidence(asset, transactions, mint)
+        safety_status = "avoid" if wallet["status"] == "avoid" else "watch" if row["safety_status"] == "watch" or wallet["status"] == "watch" else wallet["status"]
+        safety_note = (row["safety_note"] + " " if row["safety_status"] == "watch" and row["safety_note"] else "") + wallet["note"]
+        conn.execute(
+            """UPDATE candidates SET risk_flags_json=?, safety_status=?, safety_note=?, creator_address=?,
+               wallet_evidence_json=?, wallet_status=?, wallet_checked_at=? WHERE mint=?""",
+            (json.dumps((current_flags + wallet["flags"])[:6]), safety_status, safety_note, wallet["creator_address"],
+             json.dumps(wallet["evidence"]), safety_status, now, mint),
+        )
+        conn.commit()
+        stages["wallet_evidence"] = {"status": safety_status, "note": wallet["note"]}
+    elif not HELIUS_KEY:
+        stages["wallet_evidence"] = {"status": "not_configured", "note": "Helius key is not configured."}
+    else:
+        stages["wallet_evidence"] = {"status": "skipped", "note": "The token did not clear the first safety step."}
+
+    row = conn.execute("SELECT * FROM candidates WHERE mint=?", (mint,)).fetchone()
+    if row and row["safety_status"] == "pass" and COINGECKO_DEMO_API_KEY:
+        crosscheck = interpret_coingecko_pool(dict(row), fetch_coingecko_pool(row["pair_address"]))
+        conn.execute(
+            """UPDATE candidates SET crosscheck_status=?, crosscheck_note=?, crosscheck_price_usd=?,
+               crosscheck_liquidity_usd=?, crosscheck_checked_at=? WHERE mint=?""",
+            (crosscheck["status"], crosscheck["note"], crosscheck["price_usd"], crosscheck["liquidity_usd"], now, mint),
+        )
+        conn.commit()
+        stages["market_crosscheck"] = {"status": crosscheck["status"], "note": crosscheck["note"]}
+    elif not COINGECKO_DEMO_API_KEY:
+        stages["market_crosscheck"] = {"status": "not_configured", "note": "CoinGecko key is not configured."}
+    else:
+        stages["market_crosscheck"] = {"status": "skipped", "note": "The token did not clear the wallet-evidence step."}
+
+    candidate = candidate_detail(mint)
+    return {
+        "candidate": candidate,
+        "stages": stages,
+        "note": "Address research completed. A result is research evidence, not a buy instruction.",
+    }
+
+
 def build_full_scan_summary(stages: dict[str, dict[str, Any]], feed: dict[str, Any]) -> dict[str, Any]:
     """Explain a completed research scan without turning it into trade advice."""
     discovery = stages["discovery"]
@@ -1767,6 +1879,22 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def json_body(self) -> dict[str, Any]:
+        """Read a tiny JSON request body for local dashboard actions."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Request body length is invalid.") from exc
+        if length <= 0 or length > 4_096:
+            raise ValueError("A small JSON request body is required.")
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Request body must be valid JSON.") from exc
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return body
+
     def do_GET(self):
         path, _, query = self.path.partition("?")
         params = urllib.parse.parse_qs(query)
@@ -1810,6 +1938,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path, _, _ = self.path.partition("?")
         try:
+            if path == "/api/candidates/lookup":
+                body = self.json_body()
+                address = str(body.get("address") or "")
+                return self.json_response(200, research_token_address(address))
             if path == "/api/candidates/refresh":
                 return self.json_response(200, refresh_multi_source_candidates())
             if path == "/api/candidates/full-scan":
@@ -1824,6 +1956,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(200, enrich_coingecko_crosscheck())
         except UpstreamDataError as exc:
             return self.json_response(502, {"error": str(exc)})
+        except ValueError as exc:
+            return self.json_response(400, {"error": str(exc)})
         except Exception as exc:  # avoids leaking a stack trace in local browser output
             return self.json_response(500, {"error": f"Unexpected server error: {exc}"})
         return self.json_response(404, {"error": "API endpoint not found"})
@@ -1832,5 +1966,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     database().close()
     print("MemeTrace running at http://127.0.0.1:8080")
-    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  POST /api/candidates/full-scan  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
+    print("API: /api/health  /api/candidates  POST /api/candidates/lookup  POST /api/candidates/refresh  POST /api/candidates/full-scan  POST /api/candidates/quote-check  POST /api/candidates/safety-check  POST /api/candidates/wallet-check  POST /api/candidates/crosscheck  /api/cohorts")
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
