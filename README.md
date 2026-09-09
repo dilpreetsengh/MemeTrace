@@ -18,8 +18,10 @@ The first product feature is a local **Qualified Candidates** feed:
 - Provides a small local API for the dashboard.
 
 The initial cards are fictional sample fixtures. Click **Get live Solana pairs**
-in the dashboard to replace them with a deliberately small public DEX Screener
-discovery pass. No DEX Screener account or key is needed for this step.
+to replace them with a deliberately bounded multi-source discovery pass:
+DEX Screener, Solana Tracker's latest/trending/graduated feeds, and CoinGecko's
+new-pools feed. The existing Solana Tracker and CoinGecko keys enable the latter
+two sources; no additional account is required.
 
 With all four optional keys configured, **Run full research scan** performs that
 discovery pass and every bounded research gate in sequence, then gives one
@@ -46,7 +48,9 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080).
 The **Check sell routes** button uses Jupiter's public quote and token-metadata
 APIs. It never connects a wallet, creates a transaction, signs anything, or
 spends funds. Jupiter requires a free developer API key for the token metadata
-needed to calculate a roughly $5 token sell in atomic units.
+needed to calculate a roughly $5 token sell in atomic units. If a fresh token is
+not indexed in Jupiter's metadata yet, MemeTrace uses the existing Helius key to
+read public mint decimals, then retries the quote.
 
 1. Create a free key in the [Jupiter developer portal](https://developers.jup.ag/portal).
 2. In the project folder, copy `.env.example` to a new file named `.env`.
@@ -104,7 +108,7 @@ python3 -m unittest -v
 | `GET /api/health` | Confirms local database setup and counts saved records. |
 | `GET /api/candidates` | Returns the ranked candidate feed. |
 | `POST /api/candidates/full-scan` | Runs DEX Screener discovery, then the bounded Jupiter, Solana Tracker, Helius, and CoinGecko checks in order and returns one research-only final summary. |
-| `POST /api/candidates/refresh` | Pulls a small set of public Solana token profiles and qualifying pairs from DEX Screener. |
+| `POST /api/candidates/refresh` | Pulls bounded qualifying Solana cards from DEX Screener, Solana Tracker, and CoinGecko new pools. |
 | `POST /api/candidates/quote-check` | Checks up to three saved live cards for a roughly $5 Jupiter sell route; never sends a transaction. |
 | `POST /api/candidates/safety-check` | Sends route-confirmed cards to Solana Tracker and records point-in-time token-risk evidence. |
 | `POST /api/candidates/wallet-check` | Sends Tracker-clean cards to Helius for bounded public authority and transfer evidence. |
@@ -131,10 +135,11 @@ and the dashboard labels them clearly.
 
 ## Current discovery rules
 
-The DEX Screener refresh considers only a small public Solana shortlist, then
-keeps pairs that are at least five minutes old with roughly $75k–$3m market cap,
-$25k liquidity, $1k five-minute volume, and at least five recent swaps. These
-are discovery filters, not quality or safety proof.
+The multi-source refresh combines a small DEX Screener shortlist, Solana Tracker
+latest/trending/graduated token records, and two CoinGecko new-pool pages. It
+deduplicates mints and keeps pairs that are at least five minutes old with roughly
+$75k–$3m market cap, $25k liquidity, $1k five-minute volume, and at least five
+recent swaps. These are discovery filters, not quality or safety proof.
 
 ## Next build step
 
