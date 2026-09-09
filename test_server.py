@@ -80,6 +80,54 @@ class CandidateFeedTests(unittest.TestCase):
         candidate.update({"liquidity_usd": 24_999, "age_minutes": 10, "volume_5m_usd": 2_000})
         self.assertFalse(server.passes_dex_discovery_filter(candidate))
 
+    def test_jupiter_sell_quote_is_saved_without_creating_a_transaction(self):
+        now = 1_800_000_000
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({
+            "mint": "JupiterTestMint111111111111111111111111111111", "source": "dexscreener",
+            "safety_status": "pending", "price_usd": 0.02, "observed_at": now,
+        })
+        conn = server.database()
+        server.upsert_candidate(candidate, conn)
+        conn.commit()
+        calls = []
+
+        def fake_fetcher(url):
+            calls.append(url)
+            if "/tokens/v2/search" in url:
+                return [{"address": candidate["mint"], "decimals": 6}]
+            self.assertIn("/swap/v1/quote", url)
+            self.assertIn("inputMint=" + candidate["mint"], url)
+            return {"priceImpactPct": "1.25", "routePlan": [{"percent": 100}]}
+
+        result = server.enrich_jupiter_sellability(fetcher=fake_fetcher, now=now)
+        feed = server.candidate_feed()
+        live = feed["candidates"][0]
+
+        self.assertEqual(result["checked"], 1)
+        self.assertEqual(result["sellable"], 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(live["sell_quote_status"], "pass")
+        self.assertEqual(live["sell_impact_pct"], 1.25)
+        self.assertEqual(live["status"], "watch")  # safety check still blocks a real Candidate label
+        self.assertTrue(any(gate["label"] == "Small sell quote" and gate["status"] == "PASS" for gate in live["gates"]))
+
+    def test_jupiter_empty_route_marks_the_card_avoid(self):
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"source": "dexscreener", "price_usd": 0.01})
+
+        def no_route_fetcher(url):
+            if "/tokens/v2/search" in url:
+                return [{"address": candidate["mint"], "decimals": 6}]
+            return {"priceImpactPct": "0", "routePlan": []}
+
+        quote = server.check_jupiter_sell_quote(candidate, fetcher=no_route_fetcher)
+        candidate.update({"sell_quote_status": quote["status"], "sell_quote_note": quote["note"]})
+        assessment = server.candidate_assessment(candidate)
+
+        self.assertEqual(quote["status"], "no_route")
+        self.assertEqual(assessment["status"], "avoid")
+
 
 if __name__ == "__main__":
     unittest.main()
