@@ -29,6 +29,13 @@
           <p class="scan-summary" id="scan-summary">Run one full research scan to get a final, non-trading result.</p>
         </div>
         <div class="hero-actions">
+          <div class="address-search">
+            <label for="token-address">Research a Solana token address</label>
+            <div>
+              <input id="token-address" type="text" autocomplete="off" spellcheck="false" placeholder="Paste Solana mint address" />
+              <button id="address-search" class="secondary" type="button">Research address</button>
+            </div>
+          </div>
           <button id="full-scan" type="button">Run full research scan</button>
           <button id="refresh" class="secondary" type="button">Get live Solana pairs</button>
           <button id="quote-check" class="secondary" type="button">Check sell routes</button>
