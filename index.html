@@ -29,6 +29,17 @@
           <p class="scan-summary" id="scan-summary">Run one full research scan to get a final, non-trading result.</p>
         </div>
         <div class="hero-actions">
+          <details class="research-filter-panel" id="research-filter-panel">
+            <summary>Research filters <span id="filter-status">Loading…</span></summary>
+            <p>Change the research limits here, then click <b>Save filters</b> before scanning. Turning one off only removes it from the label—it does not make a token safe.</p>
+            <form id="research-filter-form" class="research-filter-form">
+              <div id="research-filter-fields"></div>
+              <div class="research-filter-actions">
+                <button id="save-research-filters" type="submit">Save filters</button>
+                <button id="reset-research-filters" class="secondary" type="button">Reset starter defaults</button>
+              </div>
+            </form>
+          </details>
           <div class="address-search">
             <label for="token-address">Research a Solana token address</label>
             <div>
