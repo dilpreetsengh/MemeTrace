@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 import server
@@ -9,11 +10,33 @@ class CandidateFeedTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db_path = server.DB_PATH
+        self.original_filters = deepcopy(server.ACTIVE_RESEARCH_FILTERS)
         server.DB_PATH = Path(self.temp_dir.name) / "test-memetrace.db"
 
     def tearDown(self):
         server.DB_PATH = self.original_db_path
+        server.ACTIVE_RESEARCH_FILTERS = self.original_filters
         self.temp_dir.cleanup()
+
+    def test_discovery_limit_can_be_turned_off_without_editing_code(self):
+        candidate = dict(server.SAMPLE_CANDIDATES[0])
+        candidate.update({"source": "dexscreener", "price_change_5m_pct": 0})
+
+        self.assertIn("five-minute momentum", server.discovery_filter_failures(candidate))
+        server.ACTIVE_RESEARCH_FILTERS["price_change_5m"]["enabled"] = False
+        self.assertNotIn("five-minute momentum", server.discovery_filter_failures(candidate))
+
+    def test_custom_limits_validate_lower_and_upper_values(self):
+        settings = deepcopy(server.DEFAULT_RESEARCH_FILTERS)
+        settings["market_cap"].update({"min": 50_000, "max": 900_000})
+
+        parsed = server.normalize_research_filters(settings)
+        self.assertEqual(parsed["market_cap"]["min"], 50_000)
+        self.assertEqual(parsed["market_cap"]["max"], 900_000)
+
+        settings["market_cap"].update({"min": 1_000_000, "max": 900_000})
+        with self.assertRaisesRegex(ValueError, "lower limit"):
+            server.normalize_research_filters(settings)
 
     def test_sample_feed_has_candidate_watch_and_avoid_states(self):
         feed = server.candidate_feed()
