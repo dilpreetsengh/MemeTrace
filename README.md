@@ -136,10 +136,14 @@ and the dashboard labels them clearly.
 ## Current discovery rules
 
 The multi-source refresh combines a small DEX Screener shortlist, Solana Tracker
-latest/trending/graduated token records, and two CoinGecko new-pool pages. It
-deduplicates mints and keeps pairs that are at least five minutes old with roughly
-$75k–$3m market cap, $25k liquidity, $1k five-minute volume, and at least five
-recent swaps. These are discovery filters, not quality or safety proof.
+latest/trending/graduated token records, and two CoinGecko new-pool pages. Tracker
+is used to discover token addresses, while DEX Screener supplies the genuine
+five-minute price, volume, and swap data used by the live filter. It deduplicates
+mints and keeps pairs that are 5 minutes to 7 days old with roughly $75k–$3m
+market cap, $25k liquidity, $1k genuine five-minute volume, at least five recent
+swaps, and at least +2% five-minute price movement. Live cards expire from the
+active feed after 30 minutes unless a new scan finds them again. These are
+discovery filters, not quality or safety proof.
 
 ## Next build step
 
