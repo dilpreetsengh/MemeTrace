@@ -23,6 +23,13 @@ HELIUS_KEY = os.getenv("HELIUS_API_KEY", "")
 
 STATUS_ORDER = {"candidate": 0, "watch": 1, "avoid": 2}
 VALID_STATUSES = set(STATUS_ORDER)
+DEX_SCREENER_API_BASE = "https://api.dexscreener.com"
+DEX_DISCOVERY_MAX_TOKENS = 15
+DEX_DISCOVERY_MIN_MARKET_CAP_USD = 75_000
+DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
+DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
+DEX_DISCOVERY_MIN_AGE_MINUTES = 5
+DEX_DISCOVERY_MIN_5M_VOLUME_USD = 1_000
 
 # Fictional fixtures let us review the first candidate feed before any live
 # market, quote, safety, or wallet provider is connected.
@@ -347,7 +354,13 @@ def serialize_candidate(row: sqlite3.Row) -> dict[str, Any]:
 def candidate_feed(status: str | None = None, limit: int = 50) -> dict[str, Any]:
     """Return explainable candidates, sorted by research status and score."""
     conn = database()
-    rows = conn.execute("SELECT * FROM candidates ORDER BY observed_at DESC LIMIT ?", (limit,)).fetchall()
+    has_live_records = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM candidates WHERE source != 'sample')"
+    ).fetchone()[0]
+    where = "WHERE source != 'sample'" if has_live_records else ""
+    rows = conn.execute(
+        f"SELECT * FROM candidates {where} ORDER BY observed_at DESC LIMIT ?", (limit,)
+    ).fetchall()
     candidates = [serialize_candidate(row) for row in rows]
     if status:
         candidates = [candidate for candidate in candidates if candidate["status"] == status]
@@ -356,12 +369,18 @@ def candidate_feed(status: str | None = None, limit: int = 50) -> dict[str, Any]
     summary = {name: sum(candidate["status"] == name for candidate in candidates) for name in STATUS_ORDER}
     summary["total"] = len(candidates)
     summary["sample"] = sum(candidate["source"] == "sample" for candidate in candidates)
+    summary["live"] = sum(candidate["source"] != "sample" for candidate in candidates)
+    is_sample_data = bool(candidates) and all(candidate["source"] == "sample" for candidate in candidates)
     return {
         "generated_at": int(time.time()),
-        "is_sample_data": bool(candidates) and all(candidate["source"] == "sample" for candidate in candidates),
+        "is_sample_data": is_sample_data,
         "summary": summary,
         "candidates": candidates,
-        "note": "Sample fixtures only. Live DEX Screener, Jupiter, safety, and wallet data are not connected yet.",
+        "note": (
+            "Sample fixtures only. Click Get live Solana pairs to load public DEX Screener data."
+            if is_sample_data else
+            "DEX Screener public pair data. Every live card is research-only Watch until Jupiter sell quotes and safety checks are connected."
+        ),
     }
 
 
@@ -378,6 +397,155 @@ def candidate_detail(mint: str) -> dict[str, Any] | None:
     ).fetchall()
     candidate["snapshots"] = [dict(snapshot) for snapshot in reversed(history)]
     return candidate
+
+
+class UpstreamDataError(RuntimeError):
+    """A public data provider could not be reached or returned unusable data."""
+
+
+def fetch_dexscreener_json(url: str) -> Any:
+    """Fetch public DEX Screener data. No account or API key is needed for this POC."""
+    request = urllib.request.Request(url, headers={"User-Agent": "MemeTrace/0.1 research dashboard"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise UpstreamDataError(f"DEX Screener returned HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpstreamDataError("Could not reach DEX Screener. Try again in a moment.") from exc
+
+
+def normalize_dexscreener_pair(pair: dict[str, Any], now: int | None = None) -> dict[str, Any] | None:
+    """Convert one public pair response into MemeTrace's chain-ready candidate shape."""
+    if pair.get("chainId") != "solana":
+        return None
+    base_token = pair.get("baseToken") or {}
+    mint = base_token.get("address")
+    if not mint:
+        return None
+    now = now or int(time.time())
+    created_at_ms = number(pair.get("pairCreatedAt"))
+    age_minutes = max(0, (now - created_at_ms / 1000) / 60) if created_at_ms else 0
+    return {
+        "mint": mint,
+        "name": base_token.get("name") or "Unknown token",
+        "symbol": base_token.get("symbol") or "UNKNOWN",
+        "chain": "solana",
+        "pair_address": pair.get("pairAddress"),
+        "source": "dexscreener",
+        "setup": "early_momentum",
+        "market_cap_usd": number(pair.get("marketCap") or pair.get("fdv")),
+        "liquidity_usd": number((pair.get("liquidity") or {}).get("usd")),
+        "volume_5m_usd": number((pair.get("volume") or {}).get("m5")),
+        "buys_5m": int(((pair.get("txns") or {}).get("m5") or {}).get("buys") or 0),
+        "sells_5m": int(((pair.get("txns") or {}).get("m5") or {}).get("sells") or 0),
+        "age_minutes": age_minutes,
+        "price_change_5m_pct": number((pair.get("priceChange") or {}).get("m5")),
+        "previous_high_market_cap_usd": None,
+        "sell_impact_pct": None,
+        "risk_flags": [],
+        "safety_status": "pending",
+        "observed_at": now,
+    }
+
+
+def passes_dex_discovery_filter(candidate: dict[str, Any]) -> bool:
+    """Cheap filter before later safety and quote API calls use any credits."""
+    market_cap = number(candidate["market_cap_usd"])
+    return (
+        DEX_DISCOVERY_MIN_MARKET_CAP_USD <= market_cap <= DEX_DISCOVERY_MAX_MARKET_CAP_USD
+        and number(candidate["liquidity_usd"]) >= DEX_DISCOVERY_MIN_LIQUIDITY_USD
+        and number(candidate["age_minutes"]) >= DEX_DISCOVERY_MIN_AGE_MINUTES
+        and number(candidate["volume_5m_usd"]) >= DEX_DISCOVERY_MIN_5M_VOLUME_USD
+        and int(candidate["buys_5m"]) + int(candidate["sells_5m"]) >= 5
+    )
+
+
+def upsert_candidate(candidate: dict[str, Any], conn: sqlite3.Connection) -> None:
+    """Store the current observation and append a small historical snapshot."""
+    values = (
+        candidate["mint"], candidate["name"], candidate["symbol"], candidate["chain"],
+        candidate["pair_address"], candidate["source"], candidate["setup"],
+        candidate["market_cap_usd"], candidate["liquidity_usd"], candidate["volume_5m_usd"],
+        candidate["buys_5m"], candidate["sells_5m"], candidate["age_minutes"],
+        candidate["price_change_5m_pct"], candidate["previous_high_market_cap_usd"],
+        candidate["sell_impact_pct"], json.dumps(candidate["risk_flags"]), candidate["safety_status"],
+        candidate["observed_at"], candidate["observed_at"],
+    )
+    conn.execute(
+        """INSERT INTO candidates(
+          mint, name, symbol, chain, pair_address, source, setup, market_cap_usd,
+          liquidity_usd, volume_5m_usd, buys_5m, sells_5m, age_minutes,
+          price_change_5m_pct, previous_high_market_cap_usd, sell_impact_pct,
+          risk_flags_json, safety_status, observed_at, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(mint) DO UPDATE SET
+          name=excluded.name, symbol=excluded.symbol, chain=excluded.chain,
+          pair_address=excluded.pair_address, source=excluded.source, setup=excluded.setup,
+          market_cap_usd=excluded.market_cap_usd, liquidity_usd=excluded.liquidity_usd,
+          volume_5m_usd=excluded.volume_5m_usd, buys_5m=excluded.buys_5m,
+          sells_5m=excluded.sells_5m, age_minutes=excluded.age_minutes,
+          price_change_5m_pct=excluded.price_change_5m_pct,
+          previous_high_market_cap_usd=excluded.previous_high_market_cap_usd,
+          sell_impact_pct=excluded.sell_impact_pct, risk_flags_json=excluded.risk_flags_json,
+          safety_status=excluded.safety_status, observed_at=excluded.observed_at""",
+        values,
+    )
+    conn.execute(
+        """INSERT INTO candidate_snapshots(
+          mint, captured_at, market_cap_usd, liquidity_usd, volume_5m_usd, price_change_5m_pct
+        ) VALUES (?,?,?,?,?,?)""",
+        (candidate["mint"], candidate["observed_at"], candidate["market_cap_usd"],
+         candidate["liquidity_usd"], candidate["volume_5m_usd"], candidate["price_change_5m_pct"]),
+    )
+
+
+def refresh_dexscreener_candidates(fetcher=fetch_dexscreener_json, now: int | None = None) -> dict[str, Any]:
+    """Discover a deliberately small set of live Solana research cards from DEX Screener."""
+    now = now or int(time.time())
+    profiles = fetcher(f"{DEX_SCREENER_API_BASE}/token-profiles/latest/v1")
+    if not isinstance(profiles, list):
+        raise UpstreamDataError("DEX Screener sent an unexpected profile response.")
+    token_addresses: list[str] = []
+    for profile in profiles:
+        if not isinstance(profile, dict) or profile.get("chainId") != "solana":
+            continue
+        address = profile.get("tokenAddress")
+        if address and address not in token_addresses:
+            token_addresses.append(address)
+        if len(token_addresses) >= DEX_DISCOVERY_MAX_TOKENS:
+            break
+
+    saved = 0
+    pairs_read = 0
+    skipped = 0
+    conn = database()
+    for address in token_addresses:
+        pairs = fetcher(f"{DEX_SCREENER_API_BASE}/token-pairs/v1/solana/{urllib.parse.quote(address)}")
+        if not isinstance(pairs, list):
+            skipped += 1
+            continue
+        normalized = [normalize_dexscreener_pair(pair, now) for pair in pairs if isinstance(pair, dict)]
+        normalized = [candidate for candidate in normalized if candidate is not None]
+        pairs_read += len(normalized)
+        qualified = [candidate for candidate in normalized if passes_dex_discovery_filter(candidate)]
+        if not qualified:
+            skipped += 1
+            continue
+        strongest_pair = max(qualified, key=lambda candidate: number(candidate["liquidity_usd"]))
+        upsert_candidate(strongest_pair, conn)
+        saved += 1
+    conn.commit()
+    return {
+        "source": "dexscreener",
+        "refreshed_at": now,
+        "profiles_read": len(profiles),
+        "solana_profiles_read": len(token_addresses),
+        "pairs_read": pairs_read,
+        "records_saved": saved,
+        "skipped": skipped,
+        "note": "Public DEX Screener pair data only. Saved records remain Watch until sell quotes and safety checks are connected.",
+    }
 
 
 def fetch_helius_wallet_transactions(address: str) -> list[dict]:
@@ -526,9 +694,20 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json_response(500, {"error": f"Unexpected server error: {exc}"})
         return super().do_GET()
 
+    def do_POST(self):
+        path, _, _ = self.path.partition("?")
+        try:
+            if path == "/api/candidates/refresh":
+                return self.json_response(200, refresh_dexscreener_candidates())
+        except UpstreamDataError as exc:
+            return self.json_response(502, {"error": str(exc)})
+        except Exception as exc:  # avoids leaking a stack trace in local browser output
+            return self.json_response(500, {"error": f"Unexpected server error: {exc}"})
+        return self.json_response(404, {"error": "API endpoint not found"})
+
 
 if __name__ == "__main__":
     database().close()
     print("MemeTrace running at http://127.0.0.1:8080")
-    print("API: /api/health  /api/candidates  /api/candidates/<mint>  /api/cohorts")
+    print("API: /api/health  /api/candidates  POST /api/candidates/refresh  /api/cohorts")
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
