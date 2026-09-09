@@ -478,8 +478,19 @@ def candidate_feed(status: str | None = None, limit: int = 50) -> dict[str, Any]
     has_live_records = conn.execute(
         "SELECT EXISTS(SELECT 1 FROM candidates WHERE source != 'sample' AND observed_at >= ?)", (fresh_cutoff,)
     ).fetchone()[0]
-    where = "WHERE source != 'sample' AND observed_at >= ?" if has_live_records else ""
-    query_params: tuple[Any, ...] = (fresh_cutoff, limit) if has_live_records else (limit,)
+    has_started_live_scan = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM imports WHERE source='live_scan')"
+    ).fetchone()[0]
+    if has_live_records:
+        where = "WHERE source != 'sample' AND observed_at >= ?"
+        query_params: tuple[Any, ...] = (fresh_cutoff, limit)
+    elif has_started_live_scan:
+        # Do not replace an empty live scan with fictional starter cards.
+        where = "WHERE 1=0"
+        query_params = (limit,)
+    else:
+        where = ""
+        query_params = (limit,)
     rows = conn.execute(
         f"SELECT * FROM candidates {where} ORDER BY observed_at DESC LIMIT ?", query_params
     ).fetchall()
@@ -501,6 +512,8 @@ def candidate_feed(status: str | None = None, limit: int = 50) -> dict[str, Any]
         "note": (
             "Sample fixtures only. Click Get live Solana pairs to load public DEX Screener data."
             if is_sample_data else
+            "No fresh Solana pairs meet the live-motion rules in this scan. Try another scan later."
+            if not candidates else
             "DEX Screener public pair data. Every live card is research-only Watch until Jupiter sell quotes and safety checks are connected."
         ),
     }
@@ -831,6 +844,10 @@ def mark_live_candidates_stale() -> None:
     """Keep history in SQLite, but remove old scan cards from the active research feed."""
     conn = database()
     conn.execute("UPDATE candidates SET observed_at=0 WHERE source != 'sample'")
+    conn.execute(
+        "INSERT INTO imports(source, created_at, records) VALUES (?,?,?)",
+        ("live_scan", int(time.time()), 0),
+    )
     conn.commit()
 
 
