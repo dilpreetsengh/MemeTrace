@@ -228,6 +228,31 @@ class CandidateFeedTests(unittest.TestCase):
 
         self.assertTrue(server.passes_dex_discovery_filter(candidate))
 
+    def test_pasted_solana_address_loads_its_pair_without_discovery_filter(self):
+        now = 1_800_000_000
+        mint = "So11111111111111111111111111111111111111112"
+
+        def fake_fetcher(url):
+            self.assertIn(mint, url)
+            return [{
+                "chainId": "solana", "pairAddress": "LookupPair111",
+                "baseToken": {"address": mint, "name": "Pasted Lookup", "symbol": "LOOK"},
+                "priceUsd": "0.02", "marketCap": 50_000, "liquidity": {"usd": 10_000},
+                "volume": {"m5": 200}, "txns": {"m5": {"buys": 2, "sells": 1}},
+                "priceChange": {"m5": 0.5}, "pairCreatedAt": (now - 86_400) * 1000,
+            }]
+
+        result = server.research_token_address(mint, pair_fetcher=fake_fetcher, now=now, run_deep_checks=False)
+
+        self.assertEqual(result["candidate"]["mint"], mint)
+        self.assertEqual(result["candidate"]["symbol"], "LOOK")
+        self.assertEqual(result["candidate"]["source"], "address_lookup")
+        self.assertEqual(result["stages"], {})
+
+    def test_pasted_evm_contract_is_not_treated_as_a_solana_mint(self):
+        with self.assertRaisesRegex(ValueError, "EVM"):
+            server.validate_solana_mint("0x1234567890abcdef1234567890abcdef12345678")
+
     def test_fresh_dex_refresh_invalidates_old_quote_and_safety_evidence(self):
         candidate = dict(server.SAMPLE_CANDIDATES[0])
         candidate.update({"mint": "FreshnessMint111111111111111111111111111111111", "source": "dexscreener", "price_usd": 0.02, "observed_at": 1_800_000_000})
