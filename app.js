@@ -75,10 +75,12 @@ function renderMetrics() {
   }
   const summary = state.data.summary;
   const metrics = [
-    ['Candidate', summary.candidate, 'passed the sample gates'],
+    ['Candidate', summary.candidate, 'passed the available gates'],
     ['Watch', summary.watch, 'needs more confirmation'],
     ['Avoid', summary.avoid, 'failed at least one hard gate'],
-    ['Data source', summary.sample + ' sample', 'live APIs come next'],
+    state.data.is_sample_data
+      ? ['Data source', summary.sample + ' sample', 'click for public pair data']
+      : ['Data source', summary.live + ' live', 'DEX Screener public data'],
   ];
   elements.metrics.innerHTML = metrics.map((metric) =>
     '<article class="metric">' +
@@ -192,9 +194,9 @@ function render() {
   if (state.data) elements.note.textContent = state.data.note;
 }
 
-async function loadCandidates() {
+async function loadCandidates({ keepButtonDisabled = false } = {}) {
   elements.dataStatus.textContent = 'Loading…';
-  elements.refresh.disabled = true;
+  if (!keepButtonDisabled) elements.refresh.disabled = true;
   try {
     const response = await fetch('/api/candidates');
     if (!response.ok) throw new Error('Candidate feed returned ' + response.status);
@@ -203,12 +205,31 @@ async function loadCandidates() {
     if (!state.selectedMint || !state.candidates.some((candidate) => candidate.mint === state.selectedMint)) {
       state.selectedMint = state.candidates[0]?.mint || null;
     }
-    elements.dataStatus.textContent = state.data.is_sample_data ? 'Sample data · local only' : 'Live data';
+    elements.dataStatus.textContent = state.data.is_sample_data ? 'Sample data · local only' : 'Live research data';
     render();
   } catch (error) {
     elements.dataStatus.textContent = 'Feed unavailable';
     elements.list.innerHTML = '<div class="empty">Could not load the local candidate feed. Start the server, then refresh.</div>';
     elements.detail.innerHTML = '<div class="empty">' + escapeHtml(error.message) + '</div>';
+  } finally {
+    if (!keepButtonDisabled) elements.refresh.disabled = false;
+  }
+}
+
+async function refreshCandidates() {
+  elements.refresh.disabled = true;
+  elements.dataStatus.textContent = 'Getting public Solana pairs…';
+  try {
+    const response = await fetch('/api/candidates/refresh', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Live refresh returned ' + response.status);
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = result.records_saved
+      ? 'Loaded ' + result.records_saved + ' live research cards'
+      : 'No pairs passed the starter filter yet';
+  } catch (error) {
+    elements.dataStatus.textContent = 'Live refresh unavailable';
+    elements.note.textContent = error.message;
   } finally {
     elements.refresh.disabled = false;
   }
@@ -231,5 +252,5 @@ elements.list.addEventListener('click', (event) => {
   renderDetail();
 });
 
-elements.refresh.addEventListener('click', loadCandidates);
+elements.refresh.addEventListener('click', refreshCandidates);
 loadCandidates();
