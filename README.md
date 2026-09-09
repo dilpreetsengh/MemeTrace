@@ -126,9 +126,10 @@ python3 -m unittest -v
 A real candidate will eventually need to pass:
 
 - Primary market-cap lane: roughly $70k–$750k.
-- At least $25k liquidity; $50k+ is stronger.
-- At least five minutes of trading history.
-- Favorable recent buy/sell pressure and volume relative to liquidity.
+- Fresh momentum lane: 10 minutes to 48 hours old, +3% to +25% in five minutes.
+- At least $25k liquidity to be observed; $50k+ and at least 15% of market cap are required for `Candidate`.
+- At least $2k genuine five-minute volume, ten recent swaps, and 1.3× buy/sell pressure.
+- Five-minute volume must be 10%–200% of liquidity; extreme turnover is kept out as possible manipulation.
 - A small live sell quote below the configured price-impact threshold.
 - No configured token, creator, or linked-holder risk flags.
 
@@ -142,11 +143,31 @@ The multi-source refresh combines a small DEX Screener shortlist, Solana Tracker
 latest/trending/graduated token records, and two CoinGecko new-pool pages. Tracker
 is used to discover token addresses, while DEX Screener supplies the genuine
 five-minute price, volume, and swap data used by the live filter. It deduplicates
-mints and keeps pairs that are 5 minutes to 7 days old with roughly $70k–$3m
+mints and keeps pairs that are 10 minutes to 48 hours old with roughly $70k–$3m
 market cap, $25k liquidity, $2k genuine five-minute volume, at least ten recent
-swaps, at least 1.15× as many buys as sells, and at least +3% five-minute price
+swaps, at least 1.3× as many buys as sells, and +3% to +25% five-minute price
 movement. Live cards expire from the active feed after 15 minutes unless a new
 scan finds them again. These are discovery filters, not quality or safety proof.
+
+## Strict risk policy
+
+For a live card to become `Candidate`, it must also pass the research pipeline:
+
+- Jupiter returns a small sell route with no more than 2% estimated price impact.
+- Solana Tracker returns no danger flag, a risk score of 3/10 or below, top-10
+  holder concentration of 15% or below, snipers at 10% or below, possible
+  insiders at 5% or below, bundled-wallet holdings at 5% or below, and developer
+  holdings at 1% or below.
+- Active mint/freeze authority is an `Avoid`. LP, bonding-curve, suspicious-volume,
+  dynamic-fee, and concentration warnings keep a card at `Watch` or `Avoid`
+  according to severity.
+- Helius must return public creator/authority metadata with no active authority and
+  no observed recent token outflow from that address. Missing metadata or outflows
+  remain `Watch`; they are evidence, not proof of identity or selling intent.
+- CoinGecko must broadly match the DEX Screener price and liquidity snapshot.
+
+These rules are intentionally strict and will often return no cards. They reduce
+obvious risks; they do not predict profit or make a token safe.
 
 ## Next build step
 
