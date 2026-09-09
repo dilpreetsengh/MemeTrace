@@ -48,9 +48,11 @@ DEX_DISCOVERY_MAX_MARKET_CAP_USD = 3_000_000
 DEX_DISCOVERY_MIN_LIQUIDITY_USD = 25_000
 DEX_DISCOVERY_MIN_AGE_MINUTES = 5
 DEX_DISCOVERY_MAX_AGE_MINUTES = 7 * 24 * 60
-DEX_DISCOVERY_MIN_5M_VOLUME_USD = 1_000
-DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT = 2
-LIVE_CANDIDATE_TTL_SECONDS = 30 * 60
+DEX_DISCOVERY_MIN_5M_VOLUME_USD = 2_000
+DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT = 3
+DEX_DISCOVERY_MIN_5M_SWAPS = 10
+DEX_DISCOVERY_MIN_BUY_SELL_RATIO = 1.15
+LIVE_CANDIDATE_TTL_SECONDS = 15 * 60
 JUPITER_API_BASE = "https://api.jup.ag"
 JUPITER_TEST_SELL_USD = 5
 JUPITER_MAX_QUOTES_PER_CHECK = 3
@@ -571,14 +573,18 @@ def normalize_dexscreener_pair(pair: dict[str, Any], now: int | None = None) -> 
 
 
 def passes_dex_discovery_filter(candidate: dict[str, Any]) -> bool:
-    """Cheap filter before later safety and quote API calls use any credits."""
+    """Keep only fresh Solana pairs with live upward movement before later API checks."""
     market_cap = number(candidate["market_cap_usd"])
+    buys = int(candidate["buys_5m"])
+    sells = int(candidate["sells_5m"])
+    buy_sell_ratio = buys / sells if sells else float(buys) if buys else 0
     return (
         DEX_DISCOVERY_MIN_MARKET_CAP_USD <= market_cap <= DEX_DISCOVERY_MAX_MARKET_CAP_USD
         and number(candidate["liquidity_usd"]) >= DEX_DISCOVERY_MIN_LIQUIDITY_USD
         and DEX_DISCOVERY_MIN_AGE_MINUTES <= number(candidate["age_minutes"]) <= DEX_DISCOVERY_MAX_AGE_MINUTES
         and number(candidate["volume_5m_usd"]) >= DEX_DISCOVERY_MIN_5M_VOLUME_USD
-        and int(candidate["buys_5m"]) + int(candidate["sells_5m"]) >= 5
+        and buys + sells >= DEX_DISCOVERY_MIN_5M_SWAPS
+        and buy_sell_ratio >= DEX_DISCOVERY_MIN_BUY_SELL_RATIO
         and number(candidate["price_change_5m_pct"]) >= DEX_DISCOVERY_MIN_5M_PRICE_CHANGE_PCT
     )
 
