@@ -279,7 +279,9 @@ async function checkSellRoutes() {
     await loadCandidates({ keepButtonDisabled: true });
     elements.dataStatus.textContent = result.checked
       ? 'Checked ' + result.checked + ' sell routes · ' + result.sellable + ' found'
-      : 'Jupiter key setup needed';
+      : (result.note || '').includes('JUPITER_API_KEY')
+        ? 'Jupiter key setup needed'
+        : 'No live cards available to quote';
     elements.note.textContent = result.note;
   } catch (error) {
     elements.dataStatus.textContent = 'Sell-route check unavailable';
@@ -307,7 +309,9 @@ async function checkTokenSafety() {
     await loadCandidates({ keepButtonDisabled: true });
     elements.dataStatus.textContent = result.checked
       ? 'Checked ' + result.checked + ' tokens · ' + result.flagged + ' risk flags'
-      : 'Safety-check setup needed';
+      : (result.note || '').includes('SOLANA_TRACKER_API_KEY')
+        ? 'Safety-check setup needed'
+        : 'No sellable cards to safety-check';
     elements.note.textContent = result.note;
   } catch (error) {
     elements.dataStatus.textContent = 'Safety check unavailable';
@@ -335,7 +339,9 @@ async function checkWalletEvidence() {
     await loadCandidates({ keepButtonDisabled: true });
     elements.dataStatus.textContent = result.checked
       ? 'Checked ' + result.checked + ' public wallet records'
-      : 'Wallet-evidence setup needed';
+      : (result.note || '').includes('HELIUS_API_KEY')
+        ? 'Wallet-evidence setup needed'
+        : 'No clean cards for wallet evidence';
     elements.note.textContent = result.note;
   } catch (error) {
     elements.dataStatus.textContent = 'Wallet evidence unavailable';
@@ -363,7 +369,9 @@ async function crosscheckMarketData() {
     await loadCandidates({ keepButtonDisabled: true });
     elements.dataStatus.textContent = result.checked
       ? 'Cross-checked ' + result.checked + ' pools · ' + result.consistent + ' consistent'
-      : 'Cross-check setup needed';
+      : (result.note || '').includes('COINGECKO_DEMO_API_KEY')
+        ? 'Cross-check setup needed'
+        : 'No fully screened cards to cross-check';
     elements.note.textContent = result.note;
   } catch (error) {
     elements.dataStatus.textContent = 'Cross-check unavailable';
