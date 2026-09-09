@@ -19,6 +19,9 @@ const elements = {
   dataStatus: document.querySelector('#data-status'),
   refresh: document.querySelector('#refresh'),
   quoteCheck: document.querySelector('#quote-check'),
+  safetyCheck: document.querySelector('#safety-check'),
+  walletCheck: document.querySelector('#wallet-check'),
+  crosscheck: document.querySelector('#crosscheck'),
   note: document.querySelector('#feed-note'),
 };
 
@@ -54,6 +57,11 @@ function formatPercent(value, decimals = 1) {
 
 function formatSetup(value) {
   return value === 'panic_reclaim' ? 'Panic reclaim' : 'Early momentum';
+}
+
+function shortAddress(value) {
+  if (!value) return 'Not returned';
+  return String(value).length > 14 ? String(value).slice(0, 6) + '…' + String(value).slice(-5) : String(value);
 }
 
 function visibleCandidates() {
@@ -162,6 +170,18 @@ function renderDetail() {
   const safetyNote = candidate.source === 'sample'
     ? '<p class="sample-note">This is fictional sample data. It does not mean the checks passed for a real token.</p>'
     : '';
+  const walletEvidence = candidate.wallet_evidence || {};
+  const providerEvidence = candidate.source === 'sample' ? '' :
+    '<section class="detail-section"><h3>Provider evidence</h3><ul class="detail-list">' +
+      '<li><b>Jupiter:</b> ' + escapeHtml(candidate.sell_quote_status || 'pending') +
+        (candidate.sell_quote_note ? ' — ' + escapeHtml(candidate.sell_quote_note) : '') + '</li>' +
+      '<li><b>Solana Tracker:</b> ' + escapeHtml(candidate.safety_status || 'pending') +
+        (candidate.safety_score !== null && candidate.safety_score !== undefined ? ' · risk score ' + escapeHtml(candidate.safety_score) + '/10' : '') + '</li>' +
+      '<li><b>Helius:</b> public creator/authority ' + escapeHtml(shortAddress(candidate.creator_address)) +
+        (walletEvidence.recent_token_outflows_from_observed_address !== undefined ? ' · observed token outflows ' + escapeHtml(walletEvidence.recent_token_outflows_from_observed_address) : '') + '</li>' +
+      '<li><b>CoinGecko:</b> ' + escapeHtml(candidate.crosscheck_status || 'pending') +
+        (candidate.crosscheck_price_usd ? ' · pool price ' + formatUsd(candidate.crosscheck_price_usd) : '') + '</li>' +
+    '</ul></section>';
 
   elements.detail.innerHTML =
     '<div class="detail-heading">' +
@@ -183,6 +203,7 @@ function renderDetail() {
     '</div>' +
     '<section class="detail-section"><h3>Why it appeared</h3><ul class="detail-list">' + reasons + '</ul></section>' +
     '<section class="detail-section"><h3>Risk gates</h3><ul class="gates">' + gates + '</ul></section>' +
+    providerEvidence +
     (warnings ? '<section class="detail-section warning-box"><h3>What still needs checking</h3><ul class="detail-list">' + warnings + '</ul></section>' : '') +
     safetyNote;
 }
@@ -220,6 +241,9 @@ async function loadCandidates({ keepButtonDisabled = false } = {}) {
 async function refreshCandidates() {
   elements.refresh.disabled = true;
   elements.quoteCheck.disabled = true;
+  elements.safetyCheck.disabled = true;
+  elements.walletCheck.disabled = true;
+  elements.crosscheck.disabled = true;
   elements.dataStatus.textContent = 'Getting public Solana pairs…';
   try {
     const response = await fetch('/api/candidates/refresh', { method: 'POST' });
@@ -235,12 +259,18 @@ async function refreshCandidates() {
   } finally {
     elements.refresh.disabled = false;
     elements.quoteCheck.disabled = false;
+    elements.safetyCheck.disabled = false;
+    elements.walletCheck.disabled = false;
+    elements.crosscheck.disabled = false;
   }
 }
 
 async function checkSellRoutes() {
   elements.refresh.disabled = true;
   elements.quoteCheck.disabled = true;
+  elements.safetyCheck.disabled = true;
+  elements.walletCheck.disabled = true;
+  elements.crosscheck.disabled = true;
   elements.dataStatus.textContent = 'Checking small sell routes…';
   try {
     const response = await fetch('/api/candidates/quote-check', { method: 'POST' });
@@ -257,6 +287,93 @@ async function checkSellRoutes() {
   } finally {
     elements.refresh.disabled = false;
     elements.quoteCheck.disabled = false;
+    elements.safetyCheck.disabled = false;
+    elements.walletCheck.disabled = false;
+    elements.crosscheck.disabled = false;
+  }
+}
+
+async function checkTokenSafety() {
+  elements.refresh.disabled = true;
+  elements.quoteCheck.disabled = true;
+  elements.safetyCheck.disabled = true;
+  elements.walletCheck.disabled = true;
+  elements.crosscheck.disabled = true;
+  elements.dataStatus.textContent = 'Checking token safety…';
+  try {
+    const response = await fetch('/api/candidates/safety-check', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Safety check returned ' + response.status);
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = result.checked
+      ? 'Checked ' + result.checked + ' tokens · ' + result.flagged + ' risk flags'
+      : 'Safety-check setup needed';
+    elements.note.textContent = result.note;
+  } catch (error) {
+    elements.dataStatus.textContent = 'Safety check unavailable';
+    elements.note.textContent = error.message;
+  } finally {
+    elements.refresh.disabled = false;
+    elements.quoteCheck.disabled = false;
+    elements.safetyCheck.disabled = false;
+    elements.walletCheck.disabled = false;
+    elements.crosscheck.disabled = false;
+  }
+}
+
+async function checkWalletEvidence() {
+  elements.refresh.disabled = true;
+  elements.quoteCheck.disabled = true;
+  elements.safetyCheck.disabled = true;
+  elements.walletCheck.disabled = true;
+  elements.crosscheck.disabled = true;
+  elements.dataStatus.textContent = 'Checking public wallet evidence…';
+  try {
+    const response = await fetch('/api/candidates/wallet-check', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Wallet evidence check returned ' + response.status);
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = result.checked
+      ? 'Checked ' + result.checked + ' public wallet records'
+      : 'Wallet-evidence setup needed';
+    elements.note.textContent = result.note;
+  } catch (error) {
+    elements.dataStatus.textContent = 'Wallet evidence unavailable';
+    elements.note.textContent = error.message;
+  } finally {
+    elements.refresh.disabled = false;
+    elements.quoteCheck.disabled = false;
+    elements.safetyCheck.disabled = false;
+    elements.walletCheck.disabled = false;
+    elements.crosscheck.disabled = false;
+  }
+}
+
+async function crosscheckMarketData() {
+  elements.refresh.disabled = true;
+  elements.quoteCheck.disabled = true;
+  elements.safetyCheck.disabled = true;
+  elements.walletCheck.disabled = true;
+  elements.crosscheck.disabled = true;
+  elements.dataStatus.textContent = 'Cross-checking pool data…';
+  try {
+    const response = await fetch('/api/candidates/crosscheck', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Market cross-check returned ' + response.status);
+    await loadCandidates({ keepButtonDisabled: true });
+    elements.dataStatus.textContent = result.checked
+      ? 'Cross-checked ' + result.checked + ' pools · ' + result.consistent + ' consistent'
+      : 'Cross-check setup needed';
+    elements.note.textContent = result.note;
+  } catch (error) {
+    elements.dataStatus.textContent = 'Cross-check unavailable';
+    elements.note.textContent = error.message;
+  } finally {
+    elements.refresh.disabled = false;
+    elements.quoteCheck.disabled = false;
+    elements.safetyCheck.disabled = false;
+    elements.walletCheck.disabled = false;
+    elements.crosscheck.disabled = false;
   }
 }
 
@@ -279,4 +396,7 @@ elements.list.addEventListener('click', (event) => {
 
 elements.refresh.addEventListener('click', refreshCandidates);
 elements.quoteCheck.addEventListener('click', checkSellRoutes);
+elements.safetyCheck.addEventListener('click', checkTokenSafety);
+elements.walletCheck.addEventListener('click', checkWalletEvidence);
+elements.crosscheck.addEventListener('click', crosscheckMarketData);
 loadCandidates();
